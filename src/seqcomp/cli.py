@@ -124,7 +124,7 @@ def _parser() -> argparse.ArgumentParser:
     compress_parser.add_argument(
         "--delete",
         action="store_true",
-        help="delete source SEQ/IDX only after verified compression",
+        help="delete each source SEQ/IDX pair immediately after verification",
     )
     compress_parser.add_argument(
         "--dry-run", action="store_true", help="show planned actions without writing"

@@ -55,14 +55,14 @@ seqcomp compress <path-to-session> --codec h265 --crf 18 --preset medium --keyin
 # Compress a single recording
 seqcomp compress <path-to-recording.seq> --dest <output-dir>
 
-# Delete source .seq and .seq.idx only after the backup has passed validation
+# Delete each source pair immediately after its compressed package is verified
 seqcomp compress <path-to-session> --dest <backup-dir> --delete
 
 # Show the planned compression/copy/deletion actions without writing anything
 seqcomp compress <path-to-session> --dest <backup-dir> --delete --dry-run
 ```
 
-> **`--delete` is irreversible.** The default output is lossy and cannot recreate the original JPEG payloads or the original SEQ bytes. Keep a second independent copy until the compressed backup has also been checked in the intended downstream analysis.
+> **`--delete` is irreversible.** Each verified source pair is deleted immediately, so a later failure can leave the folder partially processed without restoring earlier sources. The default output is lossy and cannot recreate the original JPEG payloads or the original SEQ bytes. Keep a second independent copy until the compressed backup has also been checked in the intended downstream analysis.
 
 ## Command reference
 
@@ -77,7 +77,7 @@ seqcomp compress <path-to-session> --dest <backup-dir> --delete --dry-run
 - `--keyint 250`: sets the fixed keyframe interval and closed-GOP length to 250 frames, approximately 2.5 seconds at 100 fps. Shorter intervals improve seeking/random access but usually increase file size; longer intervals favor compression.
 - **Without `--dest`**: writes `X.mkv + X.timestamps.npy + X.manifest.json` beside each source pair and leaves every unrelated file unchanged. Verified existing packages are skipped; unverified or conflicting outputs require confirmation, while `--force` replaces them.
 - **With `--dest`**: mirror-backup mode — SEQ/IDX pairs become compressed packages in the corresponding destination folders; all other files are copied atomically and accepted only when their SHA-256 matches. The directory tree, including empty directories, is preserved.
-- `--delete`: after the complete run succeeds, removes the source `.seq` and `.seq.idx` only for packages verified in this run or matched to an existing manifest by source/output SHA-256 and structural checks. Any failure or unresolved conflict keeps all pending source pairs.
+- `--delete`: immediately after each package is compressed or matched to an existing manifest and fully verified, rehashes that source `.seq + .seq.idx` pair and deletes it. A failed pair is kept and the run is marked as failed, but later recordings and ordinary files are still attempted. Earlier verified deletions are not rolled back.
 - `--dry-run`: reports the plan without creating, replacing, copying, or deleting files.
 - `--yes`: accepts destination/conflict prompts for unattended runs. `--force` recompresses valid existing packages as well.
 - Output names preserve the full source stem. For example, `20260726-20-12-06.000.seq` produces `20260726-20-12-06.000.mkv`, `20260726-20-12-06.000.timestamps.npy`, and `20260726-20-12-06.000.manifest.json`.
@@ -99,7 +99,7 @@ seqcomp compress <path-to-session> --dest <backup-dir> --delete --dry-run
 - **Automatic package validation**: every compression checks that sampled JPEG dimensions and the encoded-video dimensions match the SEQ header, that the output contains exactly one video stream and no audio, that its packet count equals the SEQ frame count, that the complete video decodes without FFmpeg errors, and that `timestamps.npy` is an `int64` array exactly equal to all IDX acquisition timestamps. Native-gray HEVC output is also checked.
 - **SHA-256 is mandatory**: source SEQ/IDX files, output MKV/timestamps, and all mirrored ordinary files are always hashed. There is no option to disable hashing.
 - **Atomic file writes**: video, timestamps, JSON, and mirrored files are written through tool-specific temporary names and renamed into place. Because one recording consists of three outputs, interruption between renames can leave an incomplete package; the next run detects it and refuses to treat it as verified.
-- **Conservative deletion**: only explicit `--delete` can remove source pairs. Deletion waits until the complete run has no failed copy, failed compression, or unresolved conflict. Immediately before deleting anything, every source SEQ/IDX pair is rehashed and compared with its manifest; if any source changed, all pending source pairs are kept.
+- **Per-recording verified deletion**: only explicit `--delete` can remove source pairs. Each SEQ/IDX pair is rehashed against its manifest immediately after its compressed package passes validation, then deleted before the next recording starts. A changed or failed pair is kept, but it does not roll back earlier verified deletions.
 - **Verified folder backup**: `.seqcomp_manifest.json` records source/output hashes and codec parameters. Re-runs skip unchanged verified content and detect modified sources, tampered outputs, and same-name/different-content ordinary files.
 - **Source/destination isolation**: source and destination folders may not contain one another. Unrelated temporary-looking user files are never cleaned up.
 - **Space check before writing**: before a real run, the destination is checked against a conservative 2x compression floor plus package and mirrored-file overhead. Insufficient space stops the run before any output or deletion.

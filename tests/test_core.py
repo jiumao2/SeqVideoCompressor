@@ -199,7 +199,7 @@ def test_delete_reuses_an_existing_verified_package(
 
 
 @pytest.mark.integration
-def test_delete_is_cancelled_if_any_source_changes_after_compression(
+def test_each_verified_pair_is_deleted_before_a_changed_later_pair(
     tmp_path: Path, monkeypatch
 ) -> None:
     runtime, settings = _runtime_and_settings()
@@ -227,9 +227,69 @@ def test_delete_is_cancelled_if_any_source_changes_after_compression(
         source, runtime, settings, dest=destination, delete=True, yes=True
     )
     assert summary.failed == 1
-    assert summary.deleted == 0
-    assert first.exists() and first_idx.exists()
+    assert summary.deleted == 1
+    assert not first.exists() and not first_idx.exists()
     assert second.exists() and second_idx.exists()
+
+
+@pytest.mark.integration
+def test_later_encoding_failure_does_not_delay_an_earlier_verified_deletion(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime, settings = _runtime_and_settings()
+    source = tmp_path / "source"
+    destination = tmp_path / "backup"
+    first = create_test_seq(source, name="first.000.seq")
+    second = create_test_seq(source, name="second.000.seq")
+    first_idx = Path(f"{first}.idx")
+    second_idx = Path(f"{second}.idx")
+
+    import seqcomp.core as core
+
+    original_compress_recording = core.compress_recording
+
+    def fail_on_second(*args, **kwargs):
+        if Path(args[0]) == second:
+            raise RuntimeError("simulated later encoder failure")
+        return original_compress_recording(*args, **kwargs)
+
+    monkeypatch.setattr(core, "compress_recording", fail_on_second)
+    summary = compress_path(
+        source, runtime, settings, dest=destination, delete=True, yes=True
+    )
+    assert summary.failed == 1
+    assert summary.deleted == 1
+    assert not first.exists() and not first_idx.exists()
+    assert second.exists() and second_idx.exists()
+    assert (destination / "first.000.mkv").is_file()
+
+
+@pytest.mark.integration
+def test_later_copy_failure_does_not_restore_a_verified_deletion(
+    tmp_path: Path, monkeypatch
+) -> None:
+    runtime, settings = _runtime_and_settings()
+    source = tmp_path / "source"
+    destination = tmp_path / "backup"
+    seq = create_test_seq(source)
+    idx = Path(f"{seq}.idx")
+    note = source / "notes.txt"
+    note.write_text("metadata", encoding="utf-8")
+
+    import seqcomp.core as core
+
+    def fail_copy(*args, **kwargs):
+        raise RuntimeError("simulated later copy failure")
+
+    monkeypatch.setattr(core, "_copy_verified", fail_copy)
+    summary = compress_path(
+        source, runtime, settings, dest=destination, delete=True, yes=True
+    )
+    assert summary.failed == 1
+    assert summary.deleted == 1
+    assert not seq.exists() and not idx.exists()
+    assert note.exists()
+    assert (destination / "test-recording.000.mkv").is_file()
 
 
 @pytest.mark.integration
@@ -289,3 +349,61 @@ def test_space_preflight_refuses_before_writing_or_deleting(
         compress_path(source, runtime, settings, delete=True, yes=True)
     assert seq.exists() and idx.exists()
     assert not (source / "test-recording.000.mkv").exists()
+
+
+def test_delete_same_volume_space_preflight_uses_one_recording_peak(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source"
+    create_test_seq(source, name="first.000.seq")
+    create_test_seq(source, name="second.000.seq")
+    pairs = list(iter_seq_pairs(source))
+    requirements = [
+        (pair.seq.stat().st_size + pair.idx.stat().st_size) // 2
+        + 16 * 1024 * 1024
+        for pair in pairs
+    ]
+
+    import seqcomp.core as core
+
+    monkeypatch.setattr(
+        core.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(free=max(requirements)),
+    )
+    core._require_space(source, None, pairs, is_file=False, delete=True)
+
+    with pytest.raises(OSError, match="Insufficient free space"):
+        core._require_space(source, None, pairs, is_file=False, delete=False)
+
+
+def test_delete_different_volume_space_preflight_remains_cumulative(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    create_test_seq(source, name="first.000.seq")
+    create_test_seq(source, name="second.000.seq")
+    pairs = list(iter_seq_pairs(source))
+    requirements = [
+        (pair.seq.stat().st_size + pair.idx.stat().st_size) // 2
+        + 16 * 1024 * 1024
+        for pair in pairs
+    ]
+
+    import seqcomp.core as core
+
+    monkeypatch.setattr(core, "_same_volume", lambda first, second: False)
+    monkeypatch.setattr(
+        core.shutil,
+        "disk_usage",
+        lambda path: SimpleNamespace(free=max(requirements)),
+    )
+    with pytest.raises(OSError, match="Insufficient free space"):
+        core._require_space(
+            source,
+            destination,
+            pairs,
+            is_file=False,
+            delete=True,
+        )

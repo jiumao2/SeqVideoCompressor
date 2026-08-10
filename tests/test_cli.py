@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,12 @@ def test_cli_version(capsys) -> None:
         main(["--version"])
     assert exc_info.value.code == 0
     assert f"seqcomp {__version__}" in capsys.readouterr().out
+
+
+def test_runtime_version_matches_project_metadata() -> None:
+    pyproject = Path(__file__).parents[1] / "pyproject.toml"
+    metadata = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    assert __version__ == metadata["project"]["version"] == "0.1.0"
 
 
 @pytest.mark.parametrize(

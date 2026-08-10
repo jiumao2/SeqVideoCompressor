@@ -29,13 +29,6 @@ class SeqPair:
 
 
 @dataclass(frozen=True)
-class PendingDeletion:
-    pair: SeqPair
-    seq_sha256: str
-    idx_sha256: str
-
-
-@dataclass(frozen=True)
 class FileSnapshot:
     size: int
     mtime_ns: int
@@ -127,6 +120,36 @@ def _stable_sha256(
     return digest, after
 
 
+def _delete_verified_pair(
+    pair: SeqPair,
+    seq_sha256: str,
+    idx_sha256: str,
+    *,
+    show_progress: bool,
+) -> None:
+    """Rehash and immediately delete one verified SEQ/IDX source pair."""
+    seq_hash, seq_snapshot = _stable_sha256(
+        pair.seq,
+        show_progress=show_progress,
+        description=f"Rehash {pair.seq.name}",
+    )
+    idx_hash, idx_snapshot = _stable_sha256(
+        pair.idx,
+        show_progress=show_progress,
+        description=f"Rehash {pair.idx.name}",
+    )
+    if seq_hash != seq_sha256:
+        raise RuntimeError(f"Source SEQ changed after compression: {pair.seq}")
+    if idx_hash != idx_sha256:
+        raise RuntimeError(f"Source IDX changed after compression: {pair.idx}")
+    if _snapshot(pair.seq) != seq_snapshot:
+        raise RuntimeError(f"Source SEQ changed after final hash: {pair.seq}")
+    if _snapshot(pair.idx) != idx_snapshot:
+        raise RuntimeError(f"Source IDX changed after final hash: {pair.idx}")
+    pair.seq.unlink()
+    pair.idx.unlink()
+
+
 def _copy_verified(
     source: Path,
     destination: Path,
@@ -209,21 +232,30 @@ def _space_target(path: Path) -> Path:
     return candidate
 
 
+def _same_volume(first: Path, second: Path) -> bool:
+    return os.stat(_space_target(first)).st_dev == os.stat(_space_target(second)).st_dev
+
+
 def _require_space(
     root: Path,
     destination_root: Path | None,
     pairs: list[SeqPair],
     *,
     is_file: bool,
+    delete: bool,
 ) -> None:
     # A conservative 2x compression floor plus 16 MiB package overhead.
-    required = sum(
+    package_requirements = [
         (pair.seq.stat().st_size + pair.idx.stat().st_size) // 2 + 16 * 1024 * 1024
         for pair in pairs
-    )
+    ]
+    target = destination_root if destination_root is not None else root
+    if delete and _same_volume(root, target):
+        required = max(package_requirements, default=0)
+    else:
+        required = sum(package_requirements)
     if destination_root is not None and not is_file:
         required += sum(path.stat().st_size for path in _other_files(root, pairs))
-    target = destination_root if destination_root is not None else root
     free = shutil.disk_usage(_space_target(target)).free
     if free < required:
         raise OSError(
@@ -275,12 +307,17 @@ def compress_path(
     if not dry_run:
         if not quiet:
             print(f"[space]    checking free space for {len(pairs)} recording(s)")
-        _require_space(root, destination_root, pairs, is_file=is_file)
+        _require_space(
+            root,
+            destination_root,
+            pairs,
+            is_file=is_file,
+            delete=delete,
+        )
 
     summary = CompressionSummary()
     recordings: dict[str, object] = {}
     copy_records: dict[str, object] = {}
-    pending_delete: list[PendingDeletion] = []
     for pair in pairs:
         relative = pair.seq.relative_to(root) if not is_file else Path(pair.seq.name)
         output_dir = (
@@ -384,9 +421,22 @@ def compress_path(
                 print(f"[failed]   {relative}: manifest error: {exc}")
             continue
         if delete:
-            pending_delete.append(
-                PendingDeletion(pair, source_seq_sha256, source_idx_sha256)
-            )
+            try:
+                if not quiet:
+                    print(f"[verify]   rehashing {relative} before deletion")
+                _delete_verified_pair(
+                    pair,
+                    source_seq_sha256,
+                    source_idx_sha256,
+                    show_progress=not quiet,
+                )
+                summary.deleted += 1
+                if not quiet:
+                    print(f"[delete]   {relative} + {pair.idx.name}")
+            except Exception as exc:
+                summary.failed += 1
+                if not quiet:
+                    print(f"[keep]     {relative}: deletion cancelled: {exc}")
 
     if destination_root is not None and not is_file:
         if not dry_run:
@@ -437,65 +487,6 @@ def compress_path(
                     "other_files": copy_records,
                 },
             )
-        deletion_snapshots: list[tuple[PendingDeletion, FileSnapshot, FileSnapshot]] = []
-        if summary.ok and pending_delete:
-            if not quiet:
-                print(
-                    f"[verify]   rehashing {len(pending_delete)} source pair(s) "
-                    "before deletion"
-                )
-            for pending in pending_delete:
-                try:
-                    seq_hash, seq_snapshot = _stable_sha256(
-                        pending.pair.seq,
-                        show_progress=not quiet,
-                        description=f"Rehash {pending.pair.seq.name}",
-                    )
-                    idx_hash, idx_snapshot = _stable_sha256(
-                        pending.pair.idx,
-                        show_progress=not quiet,
-                        description=f"Rehash {pending.pair.idx.name}",
-                    )
-                    if seq_hash != pending.seq_sha256:
-                        raise RuntimeError(
-                            f"Source SEQ changed after compression: {pending.pair.seq}"
-                        )
-                    if idx_hash != pending.idx_sha256:
-                        raise RuntimeError(
-                            f"Source IDX changed after compression: {pending.pair.idx}"
-                        )
-                    deletion_snapshots.append(
-                        (pending, seq_snapshot, idx_snapshot)
-                    )
-                except Exception as exc:
-                    summary.failed += 1
-                    if not quiet:
-                        print(f"[keep]     deletion cancelled: {exc}")
-            if summary.ok:
-                for pending, seq_snapshot, idx_snapshot in deletion_snapshots:
-                    if _snapshot(pending.pair.seq) != seq_snapshot:
-                        summary.failed += 1
-                        if not quiet:
-                            print(
-                                "[keep]     deletion cancelled; source SEQ changed "
-                                "after final hash: "
-                                f"{pending.pair.seq}"
-                            )
-                    if _snapshot(pending.pair.idx) != idx_snapshot:
-                        summary.failed += 1
-                        if not quiet:
-                            print(
-                                "[keep]     deletion cancelled; source IDX changed "
-                                "after final hash: "
-                                f"{pending.pair.idx}"
-                            )
-            if summary.ok:
-                for pending, _, _ in deletion_snapshots:
-                    pending.pair.seq.unlink()
-                    pending.pair.idx.unlink()
-                    summary.deleted += 1
-                    if not quiet:
-                        print(f"[delete]   {pending.pair.seq} + {pending.pair.idx.name}")
     return summary
 
 
