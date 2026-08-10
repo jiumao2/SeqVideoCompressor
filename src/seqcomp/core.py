@@ -1,0 +1,710 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import tempfile
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Callable, Iterator
+
+from .compress import compress_recording, verify_existing_package
+from .ffmpeg_tools import FFmpegRuntime
+from .naming import output_paths
+from .encoding import EncodingSettings
+from .runtime_utils import atomic_write_json, copy_file_with_progress, sha256_file
+from .seq_reader import SeqReader
+
+
+FOLDER_MANIFEST_NAME = ".seqcomp_manifest.json"
+DEFAULT_COMPRESSION_RATIO = 20.0
+DEFAULT_ENCODING_TIME_RATIO = 1.2
+
+
+@dataclass(frozen=True)
+class SeqPair:
+    seq: Path
+    idx: Path
+
+
+@dataclass(frozen=True)
+class PendingDeletion:
+    pair: SeqPair
+    seq_sha256: str
+    idx_sha256: str
+
+
+@dataclass(frozen=True)
+class FileSnapshot:
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+    inode: int
+
+
+@dataclass
+class CompressionSummary:
+    compressed: int = 0
+    copied: int = 0
+    skipped: int = 0
+    deleted: int = 0
+    failed: int = 0
+    conflict_skipped: int = 0
+    source_bytes: int = 0
+    output_bytes: int = 0
+    encoding_seconds: float = 0.0
+    video_seconds: float = 0.0
+
+    @property
+    def ok(self) -> bool:
+        return self.failed == 0 and self.conflict_skipped == 0
+
+    def to_dict(self) -> dict[str, int | float | bool]:
+        return {**asdict(self), "ok": self.ok}
+
+
+def format_gb(byte_count: float) -> str:
+    """Format bytes as decimal gigabytes for CLI output."""
+    return f"{byte_count / 1e9:,.2f} GB"
+
+
+def format_duration(seconds: float) -> str:
+    """Format seconds as a compact human-readable duration."""
+    seconds = max(float(seconds), 0.0)
+    if seconds >= 3600:
+        rounded = int(round(seconds))
+        hours, remainder = divmod(rounded, 3600)
+        minutes, remaining = divmod(remainder, 60)
+        return f"{hours} h {minutes} m {remaining} s"
+    if seconds >= 60:
+        minutes, remaining = divmod(int(round(seconds)), 60)
+        return f"{minutes} m {remaining} s"
+    return f"{seconds:.1f} s"
+
+
+def iter_seq_pairs(folder: str | Path) -> Iterator[SeqPair]:
+    root = Path(folder)
+    if not root.is_dir():
+        raise NotADirectoryError(root)
+    for seq in sorted(root.rglob("*"), key=lambda path: str(path).lower()):
+        if not seq.is_file() or seq.suffix.lower() != ".seq":
+            continue
+        idx = Path(f"{seq}.idx")
+        if idx.is_file():
+            yield SeqPair(seq, idx)
+
+
+def _is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _confirm(message: str, *, yes: bool, input_fn: Callable[[str], str]) -> bool:
+    if yes:
+        return True
+    return input_fn(f"{message} [y/N] ").strip().lower() in {"y", "yes"}
+
+
+def _snapshot(path: Path) -> FileSnapshot:
+    stat = path.stat()
+    return FileSnapshot(stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_ino)
+
+
+def _stable_sha256(
+    path: Path, *, show_progress: bool = False, description: str | None = None
+) -> tuple[str, FileSnapshot]:
+    before = _snapshot(path)
+    digest = sha256_file(
+        path, show_progress=show_progress, description=description
+    )
+    after = _snapshot(path)
+    if before != after:
+        raise RuntimeError(f"Source changed while hashing: {path}")
+    return digest, after
+
+
+def _copy_verified(
+    source: Path,
+    destination: Path,
+    *,
+    force: bool,
+    yes: bool,
+    dry_run: bool,
+    show_progress: bool,
+    input_fn: Callable[[str], str],
+) -> tuple[str, dict[str, object]]:
+    source_hash = sha256_file(
+        source,
+        show_progress=show_progress,
+        description=f"Hash source {source.name}",
+    )
+    record: dict[str, object] = {
+        "source_sha256": source_hash,
+        "bytes": source.stat().st_size,
+    }
+    if destination.exists():
+        if destination.is_file() and sha256_file(
+            destination,
+            show_progress=show_progress,
+            description=f"Hash existing {destination.name}",
+        ) == source_hash:
+            record["destination_sha256"] = source_hash
+            return "skipped", record
+        if not (force or _confirm(f"Replace conflicting file {destination}?", yes=yes, input_fn=input_fn)):
+            return "conflict", record
+    if dry_run:
+        return "copied", record
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        prefix=f".{destination.name}.",
+        suffix=".seqcomp-copy.tmp",
+        dir=destination.parent,
+        delete=False,
+    ) as temporary_stream:
+        temporary = Path(temporary_stream.name)
+    try:
+        copy_file_with_progress(
+            source,
+            temporary,
+            show_progress=show_progress,
+            description=f"Copy {source.name}",
+        )
+        copied_hash = sha256_file(
+            temporary,
+            show_progress=show_progress,
+            description=f"Verify copy {source.name}",
+        )
+        if copied_hash != source_hash:
+            raise RuntimeError(f"SHA-256 mismatch while copying {source}")
+        os.replace(temporary, destination)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    record["destination_sha256"] = copied_hash
+    return "copied", record
+
+
+def _other_files(root: Path, pairs: list[SeqPair]) -> Iterator[Path]:
+    excluded: set[Path] = {root / FOLDER_MANIFEST_NAME}
+    for pair in pairs:
+        excluded.update((pair.seq, pair.idx))
+        outputs = output_paths(pair.seq, pair.seq.parent)
+        excluded.update((outputs.video, outputs.timestamps, outputs.manifest))
+    for path in sorted(root.rglob("*"), key=lambda item: str(item).lower()):
+        if path.is_file() and path not in excluded and path.name != FOLDER_MANIFEST_NAME:
+            yield path
+
+
+def _space_target(path: Path) -> Path:
+    candidate = path
+    while not candidate.exists():
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+    return candidate
+
+
+def _require_space(
+    root: Path,
+    destination_root: Path | None,
+    pairs: list[SeqPair],
+    *,
+    is_file: bool,
+) -> None:
+    # A conservative 2x compression floor plus 16 MiB package overhead.
+    required = sum(
+        (pair.seq.stat().st_size + pair.idx.stat().st_size) // 2 + 16 * 1024 * 1024
+        for pair in pairs
+    )
+    if destination_root is not None and not is_file:
+        required += sum(path.stat().st_size for path in _other_files(root, pairs))
+    target = destination_root if destination_root is not None else root
+    free = shutil.disk_usage(_space_target(target)).free
+    if free < required:
+        raise OSError(
+            f"Insufficient free space at {target}: need approximately "
+            f"{format_gb(required)}, have {format_gb(free)}"
+        )
+
+
+def compress_path(
+    input_path: str | Path,
+    runtime: FFmpegRuntime,
+    settings: EncodingSettings,
+    *,
+    dest: str | Path | None = None,
+    pipeline: str = "jpeg-pipe",
+    delete: bool = False,
+    dry_run: bool = False,
+    force: bool = False,
+    yes: bool = False,
+    quiet: bool = False,
+    input_fn: Callable[[str], str] = input,
+) -> CompressionSummary:
+    source = Path(input_path).resolve()
+    if not source.exists():
+        raise FileNotFoundError(source)
+    is_file = source.is_file()
+    if is_file and source.suffix.lower() != ".seq":
+        raise ValueError(f"Expected a .seq file or folder, got: {source}")
+    root = source.parent if is_file else source
+    if not quiet:
+        print(f"[scan]     {source}")
+    pairs = [SeqPair(source, Path(f"{source}.idx"))] if is_file else list(iter_seq_pairs(root))
+    if is_file and not pairs[0].idx.is_file():
+        raise FileNotFoundError(pairs[0].idx)
+    if not pairs:
+        raise ValueError(f"No .seq + .seq.idx pairs found under {source}")
+
+    destination_root = Path(dest).resolve() if dest is not None else None
+    if destination_root is not None:
+        if not is_file and (
+            destination_root == root
+            or _is_within(destination_root, root)
+            or _is_within(root, destination_root)
+        ):
+            raise ValueError("Source and destination folders must not contain each other")
+        if destination_root.exists() and any(destination_root.iterdir()):
+            if not _confirm(f"Destination {destination_root} is not empty; continue?", yes=yes, input_fn=input_fn):
+                raise RuntimeError("Destination confirmation declined")
+    if not dry_run:
+        if not quiet:
+            print(f"[space]    checking free space for {len(pairs)} recording(s)")
+        _require_space(root, destination_root, pairs, is_file=is_file)
+
+    summary = CompressionSummary()
+    recordings: dict[str, object] = {}
+    copy_records: dict[str, object] = {}
+    pending_delete: list[PendingDeletion] = []
+    for pair in pairs:
+        relative = pair.seq.relative_to(root) if not is_file else Path(pair.seq.name)
+        output_dir = (
+            destination_root / relative.parent
+            if destination_root is not None
+            else pair.seq.parent
+        )
+        if not quiet:
+            print(f"[check]    {relative}")
+        try:
+            verified, reason, outputs = verify_existing_package(
+                pair.seq,
+                output_dir,
+                runtime,
+                settings,
+                show_progress=not quiet,
+            )
+        except Exception as exc:
+            summary.failed += 1
+            if not quiet:
+                print(f"[failed]   {relative}: validation error: {exc}")
+            continue
+        compressed_now = False
+        if verified and not force:
+            summary.skipped += 1
+            if not quiet:
+                print(f"[skip]     {relative} (existing package verified)")
+        else:
+            exists = any(path.exists() for path in (outputs.video, outputs.timestamps, outputs.manifest))
+            if exists and not (force or _confirm(f"Replace unverified output for {relative} ({reason})?", yes=yes, input_fn=input_fn)):
+                summary.conflict_skipped += 1
+                if not quiet:
+                    print(f"[conflict] {relative} ({reason})")
+                continue
+            if dry_run:
+                summary.compressed += 1
+                if not quiet:
+                    source_bytes = pair.seq.stat().st_size + pair.idx.stat().st_size
+                    print(
+                        f"[compress] {relative} ({format_gb(source_bytes)}, dry run)"
+                    )
+                continue
+            try:
+                if not quiet:
+                    source_bytes = pair.seq.stat().st_size + pair.idx.stat().st_size
+                    print(f"[compress] {relative} ({format_gb(source_bytes)})")
+                compress_recording(
+                    pair.seq,
+                    output_dir,
+                    runtime,
+                    settings,
+                    pipeline=pipeline,
+                    overwrite=exists or force,
+                    show_progress=not quiet,
+                )
+                outputs = output_paths(pair.seq, output_dir)
+                summary.compressed += 1
+                compressed_now = True
+            except Exception as exc:
+                summary.failed += 1
+                if not quiet:
+                    print(f"[failed]   {relative}: {exc}")
+                continue
+        try:
+            manifest = json.loads(outputs.manifest.read_text(encoding="utf-8"))
+            source_seq_sha256 = manifest["source"]["seq_sha256"]
+            source_idx_sha256 = manifest["source"]["idx_sha256"]
+            recordings[relative.as_posix()] = {
+                "source_seq_sha256": source_seq_sha256,
+                "source_idx_sha256": source_idx_sha256,
+                "video_sha256": manifest["video"]["video_sha256"],
+                "timestamps_sha256": manifest["timestamps"]["timestamps_sha256"],
+                "parameters": manifest["encoding"],
+            }
+            if compressed_now:
+                compression = manifest["compression"]
+                encode = manifest["encode"]
+                source_bytes = int(compression["source_package_bytes"])
+                output_bytes = int(
+                    compression["output_video_and_timestamps_bytes"]
+                )
+                video_seconds = float(compression["source_duration_seconds"])
+                encoding_seconds = float(encode["wall_seconds"])
+                summary.source_bytes += source_bytes
+                summary.output_bytes += output_bytes
+                summary.video_seconds += video_seconds
+                summary.encoding_seconds += encoding_seconds
+                if not quiet:
+                    ratio = source_bytes / output_bytes if output_bytes else float("inf")
+                    time_ratio = (
+                        encoding_seconds / video_seconds if video_seconds else 0.0
+                    )
+                    print(
+                        f"[done]     {relative}: {format_gb(source_bytes)} -> "
+                        f"{format_gb(output_bytes)} ({ratio:.1f}x, "
+                        f"{time_ratio:.2f}x video time)"
+                    )
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            summary.failed += 1
+            if not quiet:
+                print(f"[failed]   {relative}: manifest error: {exc}")
+            continue
+        if delete:
+            pending_delete.append(
+                PendingDeletion(pair, source_seq_sha256, source_idx_sha256)
+            )
+
+    if destination_root is not None and not is_file:
+        if not dry_run:
+            for directory in sorted((path for path in root.rglob("*") if path.is_dir())):
+                (destination_root / directory.relative_to(root)).mkdir(parents=True, exist_ok=True)
+        for other in _other_files(root, pairs):
+            relative = other.relative_to(root)
+            try:
+                if not quiet:
+                    print(f"[check]    {relative} (ordinary file)")
+                action, record = _copy_verified(
+                    other,
+                    destination_root / relative,
+                    force=force,
+                    yes=yes,
+                    dry_run=dry_run,
+                    show_progress=not quiet,
+                    input_fn=input_fn,
+                )
+                copy_records[relative.as_posix()] = record
+                if action == "copied":
+                    summary.copied += 1
+                    if not quiet:
+                        print(f"[copy]     {relative} ({format_gb(other.stat().st_size)})")
+                elif action == "skipped":
+                    summary.skipped += 1
+                    if not quiet:
+                        print(f"[skip]     {relative} (identical copy exists)")
+                else:
+                    summary.conflict_skipped += 1
+                    if not quiet:
+                        print(f"[conflict] {relative}")
+            except Exception as exc:
+                summary.failed += 1
+                if not quiet:
+                    print(f"[failed]   {relative}: copy error: {exc}")
+
+    if not dry_run:
+        if not is_file or destination_root is not None:
+            manifest_root = destination_root if destination_root is not None else root
+            manifest_root.mkdir(parents=True, exist_ok=True)
+            atomic_write_json(
+                manifest_root / FOLDER_MANIFEST_NAME,
+                {
+                    "schema_version": 1,
+                    "source_root": str(root),
+                    "recordings": recordings,
+                    "other_files": copy_records,
+                },
+            )
+        deletion_snapshots: list[tuple[PendingDeletion, FileSnapshot, FileSnapshot]] = []
+        if summary.ok and pending_delete:
+            if not quiet:
+                print(
+                    f"[verify]   rehashing {len(pending_delete)} source pair(s) "
+                    "before deletion"
+                )
+            for pending in pending_delete:
+                try:
+                    seq_hash, seq_snapshot = _stable_sha256(
+                        pending.pair.seq,
+                        show_progress=not quiet,
+                        description=f"Rehash {pending.pair.seq.name}",
+                    )
+                    idx_hash, idx_snapshot = _stable_sha256(
+                        pending.pair.idx,
+                        show_progress=not quiet,
+                        description=f"Rehash {pending.pair.idx.name}",
+                    )
+                    if seq_hash != pending.seq_sha256:
+                        raise RuntimeError(
+                            f"Source SEQ changed after compression: {pending.pair.seq}"
+                        )
+                    if idx_hash != pending.idx_sha256:
+                        raise RuntimeError(
+                            f"Source IDX changed after compression: {pending.pair.idx}"
+                        )
+                    deletion_snapshots.append(
+                        (pending, seq_snapshot, idx_snapshot)
+                    )
+                except Exception as exc:
+                    summary.failed += 1
+                    if not quiet:
+                        print(f"[keep]     deletion cancelled: {exc}")
+            if summary.ok:
+                for pending, seq_snapshot, idx_snapshot in deletion_snapshots:
+                    if _snapshot(pending.pair.seq) != seq_snapshot:
+                        summary.failed += 1
+                        if not quiet:
+                            print(
+                                "[keep]     deletion cancelled; source SEQ changed "
+                                "after final hash: "
+                                f"{pending.pair.seq}"
+                            )
+                    if _snapshot(pending.pair.idx) != idx_snapshot:
+                        summary.failed += 1
+                        if not quiet:
+                            print(
+                                "[keep]     deletion cancelled; source IDX changed "
+                                "after final hash: "
+                                f"{pending.pair.idx}"
+                            )
+            if summary.ok:
+                for pending, _, _ in deletion_snapshots:
+                    pending.pair.seq.unlink()
+                    pending.pair.idx.unlink()
+                    summary.deleted += 1
+                    if not quiet:
+                        print(f"[delete]   {pending.pair.seq} + {pending.pair.idx.name}")
+    return summary
+
+
+def status_path(input_path: str | Path) -> list[dict[str, object]]:
+    """Return machine-readable recording states and exact byte counts."""
+    source = Path(input_path).resolve()
+    if not source.exists():
+        raise FileNotFoundError(source)
+    is_file = source.is_file()
+    pairs = [SeqPair(source, Path(f"{source}.idx"))] if is_file else list(iter_seq_pairs(source))
+    if is_file and not pairs[0].idx.is_file():
+        raise FileNotFoundError(pairs[0].idx)
+    root = source.parent if source.is_file() else source
+    raw_by_base = {
+        (pair.seq.relative_to(root) if not is_file else Path(pair.seq.name)).as_posix()[: -len(".seq")]: pair
+        for pair in pairs
+    }
+    output_bases: set[str] = set()
+    if not is_file:
+        suffixes = (".mkv", ".timestamps.npy", ".manifest.json")
+        for path in root.rglob("*"):
+            if not path.is_file() or path.name == FOLDER_MANIFEST_NAME:
+                continue
+            relative = path.relative_to(root).as_posix()
+            for suffix in suffixes:
+                if relative.endswith(suffix):
+                    output_bases.add(relative[: -len(suffix)])
+                    break
+    rows: list[dict[str, object]] = []
+    for base in sorted(set(raw_by_base) | output_bases):
+        pair = raw_by_base.get(base)
+        output_root = root / Path(base).parent
+        output_seq = root / f"{base}.seq"
+        outputs = output_paths(output_seq, output_root)
+        existing = [path.is_file() for path in (outputs.video, outputs.timestamps, outputs.manifest)]
+        has_raw = pair is not None
+        if has_raw and all(existing):
+            state = "both"
+        elif has_raw and not any(existing):
+            state = "raw-only"
+        elif not has_raw and all(existing):
+            state = "compressed-only"
+        else:
+            state = "incomplete"
+        source_bytes = (
+            pair.seq.stat().st_size + pair.idx.stat().st_size if pair else 0
+        )
+        duration_seconds: float | None = None
+        source_size_from = "raw" if pair else "unknown"
+        error: str | None = None
+        if pair:
+            try:
+                reader = SeqReader(pair.seq)
+                duration_seconds = reader.frame_count / reader.header.frame_rate
+            except Exception as exc:
+                error = str(exc)
+        if outputs.manifest.is_file():
+            try:
+                manifest = json.loads(outputs.manifest.read_text(encoding="utf-8"))
+                if isinstance(manifest, Mapping):
+                    compression = manifest.get("compression")
+                    if isinstance(compression, Mapping):
+                        if not source_bytes:
+                            source_bytes = int(
+                                compression.get("source_package_bytes", 0)
+                            )
+                            if source_bytes:
+                                source_size_from = "manifest"
+                        if duration_seconds is None:
+                            recorded_duration = compression.get(
+                                "source_duration_seconds"
+                            )
+                            if recorded_duration is not None:
+                                duration_seconds = float(recorded_duration)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                pass
+        rows.append(
+            {
+                "seq": f"{base}.seq",
+                "state": state,
+                "source_bytes": source_bytes,
+                "source_size_from": source_size_from,
+                "output_bytes": sum(
+                    path.stat().st_size
+                    for path in (outputs.video, outputs.timestamps)
+                    if path.is_file()
+                ),
+                "video_duration_seconds": duration_seconds,
+                "error": error,
+            }
+        )
+    return rows
+
+
+def status_report(
+    input_path: str | Path,
+    compression_ratio: float = DEFAULT_COMPRESSION_RATIO,
+    encoding_time_ratio: float = DEFAULT_ENCODING_TIME_RATIO,
+) -> str:
+    """Return a human-readable folder summary with actual and estimated totals."""
+    if compression_ratio <= 0:
+        raise ValueError("compression ratio must be greater than zero")
+    if encoding_time_ratio <= 0:
+        raise ValueError("encoding time ratio must be greater than zero")
+    source = Path(input_path).resolve()
+    rows = status_path(source)
+    lines = [
+        f"Status: {source}",
+        (
+            f"Estimates: {compression_ratio:g}x compression, "
+            f"{encoding_time_ratio:g}x video duration for encoding"
+        ),
+    ]
+    counts = {
+        "raw-only": 0,
+        "both": 0,
+        "compressed-only": 0,
+        "incomplete": 0,
+    }
+    known_original_bytes = 0.0
+    projected_output_bytes = 0.0
+    remaining_source_bytes = 0.0
+    remaining_output_bytes = 0.0
+    remaining_duration_seconds = 0.0
+
+    for row in rows:
+        state = str(row["state"])
+        counts[state] += 1
+        source_bytes = float(row["source_bytes"])
+        output_bytes = float(row["output_bytes"])
+        duration = row["video_duration_seconds"]
+        duration_seconds = float(duration) if duration is not None else 0.0
+        lines.append("")
+        lines.append(f"[{state}] {row['seq']}")
+
+        if state == "raw-only":
+            estimated_output = source_bytes / compression_ratio
+            estimated_saving = source_bytes - estimated_output
+            estimated_time = duration_seconds * encoding_time_ratio
+            known_original_bytes += source_bytes
+            projected_output_bytes += estimated_output
+            remaining_source_bytes += source_bytes
+            remaining_output_bytes += estimated_output
+            remaining_duration_seconds += duration_seconds
+            lines.append(
+                f"  Source {format_gb(source_bytes)} -> estimated output "
+                f"{format_gb(estimated_output)}"
+            )
+            lines.append(
+                f"  Estimated saving {format_gb(estimated_saving)} | "
+                f"video {format_duration(duration_seconds)} | "
+                f"encoding ~{format_duration(estimated_time)}"
+            )
+        elif state in {"both", "compressed-only"}:
+            if source_bytes:
+                saved = source_bytes - output_bytes
+                ratio = source_bytes / output_bytes if output_bytes else float("inf")
+                known_original_bytes += source_bytes
+                projected_output_bytes += output_bytes
+                lines.append(
+                    f"  Source {format_gb(source_bytes)} -> output "
+                    f"{format_gb(output_bytes)} ({ratio:.1f}x)"
+                )
+                lines.append(f"  Saved {format_gb(saved)}")
+            else:
+                lines.append(f"  Output {format_gb(output_bytes)} (source size unknown)")
+        else:
+            lines.append(
+                f"  Source {format_gb(source_bytes)} | partial output "
+                f"{format_gb(output_bytes)}"
+            )
+        if row["error"]:
+            lines.append(f"  Warning: {row['error']}")
+
+    total_count = len(rows)
+    total_saving = known_original_bytes - projected_output_bytes
+    overall_ratio = (
+        known_original_bytes / projected_output_bytes
+        if projected_output_bytes
+        else 0.0
+    )
+    remaining_saving = remaining_source_bytes - remaining_output_bytes
+    lines.extend(
+        [
+            "",
+            "Summary",
+            (
+                f"  Recordings: {total_count} | raw-only {counts['raw-only']} | "
+                f"both {counts['both']} | compressed-only "
+                f"{counts['compressed-only']} | incomplete {counts['incomplete']}"
+            ),
+            (
+                f"  Original data represented: {format_gb(known_original_bytes)} | "
+                f"compressed/projected: {format_gb(projected_output_bytes)}"
+            ),
+            (
+                f"  Total space saving: {format_gb(total_saving)}"
+                + (f" ({overall_ratio:.1f}x overall)" if overall_ratio else "")
+            ),
+            (
+                f"  Remaining raw-only: {format_gb(remaining_source_bytes)} -> "
+                f"~{format_gb(remaining_output_bytes)} | saving "
+                f"~{format_gb(remaining_saving)}"
+            ),
+            (
+                f"  Remaining video: {format_duration(remaining_duration_seconds)} | "
+                f"estimated encoding: "
+                f"~{format_duration(remaining_duration_seconds * encoding_time_ratio)}"
+            ),
+        ]
+    )
+    return "\n".join(lines)
