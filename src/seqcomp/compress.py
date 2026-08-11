@@ -136,6 +136,15 @@ def _video_probe_error(
         return "video codec mismatch"
     if settings.codec == "libx265" and probe.get("pix_fmt") != "gray":
         return "CPU HEVC pixel format is not gray"
+    if settings.codec == "libsvtav1":
+        if probe.get("profile") != "Main":
+            return "SVT-AV1 profile is not Main"
+        if probe.get("pix_fmt") not in {"yuv420p", "yuvj420p"}:
+            return "SVT-AV1 pixel format is not 8-bit 4:2:0"
+        if probe.get("color_range") != "pc":
+            return "SVT-AV1 color range is not full-range (pc)"
+        if probe.get("color_space") != "bt470bg":
+            return "SVT-AV1 color space is not bt470bg"
     if settings.is_gpu:
         if probe.get("profile") != "Main":
             return "NVENC HEVC profile is not Main"

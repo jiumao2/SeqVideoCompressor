@@ -56,9 +56,9 @@ def _add_codec_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--crf",
-        type=_bounded_int("CRF", 1, 51),
+        type=_bounded_int("CRF", 1, 63),
         default=None,
-        help="CPU quality level; lower is higher quality/larger (default: 18)",
+        help="CPU quality level; defaults to 18, or 28 for AV1",
     )
     parser.add_argument(
         "--preset",
@@ -71,6 +71,13 @@ def _add_codec_arguments(parser: argparse.ArgumentParser) -> None:
         type=_bounded_int("keyint", 1),
         default=250,
         help="maximum keyframe interval in frames (default: 250)",
+    )
+    parser.add_argument(
+        "--av1-preset",
+        type=_bounded_int("AV1 preset", 0, 13),
+        default=None,
+        metavar="N",
+        help="SVT-AV1 effort preset, 0 is slowest (default: 6)",
     )
     parser.add_argument(
         "--gpu",
@@ -254,6 +261,7 @@ def _run(args: argparse.Namespace) -> int:
             cq=args.cq,
             gpu_preset=args.gpu_preset,
             gpu_device=args.gpu_device,
+            av1_preset=args.av1_preset,
         )
         if not args.quiet:
             label = "NVIDIA H.265 NVENC" if settings.is_gpu else settings.codec

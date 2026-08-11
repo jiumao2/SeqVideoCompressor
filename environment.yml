@@ -6,6 +6,7 @@ dependencies:
   - ffmpeg
   - x264
   - x265
+  - svt-av1
   - numpy
   - opencv
   - psutil

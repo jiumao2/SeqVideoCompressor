@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 
-CODEC_NAMES = {"h264": "libx264", "h265": "libx265"}
+CODEC_NAMES = {"h264": "libx264", "h265": "libx265", "av1": "libsvtav1"}
 PRESETS = (
     "ultrafast",
     "superfast",
@@ -22,13 +22,15 @@ DEFAULT_CPU_PRESET = "medium"
 DEFAULT_CQ = 28
 DEFAULT_GPU_PRESET = "p5"
 DEFAULT_KEYINT = 250
+DEFAULT_AV1_CRF = 28
+DEFAULT_AV1_PRESET = 6
 
 
 @dataclass(frozen=True)
 class EncodingSettings:
     codec: str
     crf: int | None
-    preset: str
+    preset: str | int
     keyint: int
     cq: int | None = None
     gpu_device: int | None = None
@@ -39,16 +41,25 @@ class EncodingSettings:
 
     @property
     def codec_family(self) -> str:
-        return "h264" if self.codec == "libx264" else "h265"
+        return {
+            "libx264": "h264",
+            "libx265": "h265",
+            "libsvtav1": "av1",
+            "hevc_nvenc": "h265",
+        }[self.codec]
 
     @property
     def ffprobe_codec(self) -> str:
-        return "h264" if self.codec_family == "h264" else "hevc"
+        return {"h264": "h264", "h265": "hevc", "av1": "av1"}[
+            self.codec_family
+        ]
 
     @property
     def name(self) -> str:
         if self.is_gpu:
             return f"nvenc-cq{self.cq}-{self.preset}"
+        if self.codec == "libsvtav1":
+            return f"svtav1-crf{self.crf}-preset{self.preset}"
         short_codec = "x264" if self.codec == "libx264" else "x265"
         return f"{short_codec}-crf{self.crf}-{self.preset}"
 
@@ -87,6 +98,25 @@ class EncodingSettings:
                 "gray",
                 "-x265-params",
                 parameters,
+            ]
+        if self.codec == "libsvtav1":
+            return [
+                "-vf",
+                "scale=in_range=full:out_range=full,format=yuv420p",
+                "-color_range",
+                "pc",
+                "-colorspace",
+                "bt470bg",
+                "-c:v",
+                "libsvtav1",
+                "-preset",
+                str(self.preset),
+                "-crf",
+                str(self.crf),
+                "-g",
+                str(self.keyint),
+                "-pix_fmt",
+                "yuv420p",
             ]
         if self.codec == "hevc_nvenc":
             arguments = [
@@ -149,6 +179,15 @@ class EncodingSettings:
         }
         if not self.is_gpu:
             common["crf"] = self.crf
+            if self.codec == "libsvtav1":
+                common.update(
+                    {
+                        "profile": "main",
+                        "pixel_format": "yuv420p",
+                        "color_range": "pc",
+                        "color_space": "bt470bg",
+                    }
+                )
             return common
         common.update(
             {
@@ -176,7 +215,7 @@ class EncodingSettings:
     def manifest_matches(
         self, recorded: Mapping[str, object], schema_version: int
     ) -> tuple[bool, str | None]:
-        if schema_version == 2 and not self.is_gpu:
+        if schema_version == 2 and self.codec in {"libx264", "libx265"}:
             expected = {
                 "codec": self.codec,
                 "preset": self.preset,
@@ -203,6 +242,7 @@ def make_settings(
     cq: int | None = None,
     gpu_preset: str | None = None,
     gpu_device: int | None = None,
+    av1_preset: int | None = None,
 ) -> EncodingSettings:
     if codec not in CODEC_NAMES:
         raise ValueError(f"codec must be one of: {', '.join(CODEC_NAMES)}")
@@ -215,6 +255,8 @@ def make_settings(
             raise ValueError("--crf is CPU-only; use --cq with --gpu")
         if preset is not None:
             raise ValueError("--preset is CPU-only; use --gpu-preset with --gpu")
+        if av1_preset is not None:
+            raise ValueError("--av1-preset cannot be used with --gpu")
         selected_cq = DEFAULT_CQ if cq is None else cq
         selected_preset = DEFAULT_GPU_PRESET if gpu_preset is None else gpu_preset
         if not 1 <= selected_cq <= 51:
@@ -233,6 +275,20 @@ def make_settings(
         )
     if cq is not None or gpu_preset is not None or gpu_device is not None:
         raise ValueError("--cq, --gpu-preset, and --gpu-device require --gpu")
+    if codec == "av1":
+        if preset is not None:
+            raise ValueError("--preset does not apply to AV1; use --av1-preset")
+        selected_crf = DEFAULT_AV1_CRF if crf is None else crf
+        selected_av1_preset = DEFAULT_AV1_PRESET if av1_preset is None else av1_preset
+        if not 1 <= selected_crf <= 63:
+            raise ValueError("AV1 crf must be between 1 and 63; CRF 0 is not supported")
+        if not 0 <= selected_av1_preset <= 13:
+            raise ValueError("AV1 preset must be between 0 and 13")
+        return EncodingSettings(
+            "libsvtav1", selected_crf, selected_av1_preset, keyint
+        )
+    if av1_preset is not None:
+        raise ValueError("--av1-preset requires --codec av1")
     selected_crf = DEFAULT_CRF if crf is None else crf
     selected_preset = DEFAULT_CPU_PRESET if preset is None else preset
     if not 1 <= selected_crf <= 51:

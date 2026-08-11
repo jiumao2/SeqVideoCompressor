@@ -113,7 +113,12 @@ def inspect_ffmpeg(
             [str(ffmpeg), "-hide_banner", "-h", f"encoder={encoder}"],
             f"{encoder} capability probe",
         )
-        required_text = ("yuv420p", "-cq", "-gpu") if encoder == "hevc_nvenc" else ("gray",)
+        if encoder == "hevc_nvenc":
+            required_text = ("yuv420p", "-cq", "-gpu")
+        elif encoder == "libsvtav1":
+            required_text = ("yuv420p", "-crf", "-preset")
+        else:
+            required_text = ("gray",)
         absent = [item for item in required_text if item not in details]
         if absent:
             raise FFmpegCapabilityError(

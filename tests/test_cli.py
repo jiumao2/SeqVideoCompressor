@@ -11,6 +11,7 @@ import pytest
 from conftest import create_test_seq
 from seqcomp import __version__
 from seqcomp.cli import main
+from seqcomp.ffmpeg_tools import FFmpegCapabilityError
 
 
 def test_cli_version(capsys) -> None:
@@ -29,12 +30,14 @@ def test_runtime_version_matches_project_metadata() -> None:
 @pytest.mark.parametrize(
     "arguments",
     [
-        ["compress", "input", "--crf", "52"],
+        ["compress", "input", "--crf", "64"],
         ["compress", "input", "--crf", "0"],
         ["compress", "input", "--keyint", "0"],
         ["compress", "input", "--codec", "vp9"],
         ["compress", "input", "--cq", "0"],
         ["compress", "input", "--gpu-device", "-1"],
+        ["compress", "input", "--av1-preset", "-1"],
+        ["compress", "input", "--av1-preset", "14"],
         ["compress", "input", "--pipeline", "jpeg-pipe"],
     ],
 )
@@ -74,6 +77,68 @@ def test_cli_reports_gpu_parameter_conflicts(
 ) -> None:
     assert main(arguments) == 1
     assert message in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["compress", "input", "--codec", "av1", "--preset", "medium"], "use --av1-preset"),
+        (["compress", "input", "--codec", "h265", "--av1-preset", "6"], "requires --codec av1"),
+        (["compress", "input", "--gpu", "--av1-preset", "6"], "cannot be used with --gpu"),
+        (["compress", "input", "--codec", "av1", "--gpu"], "only --codec h265"),
+        (["compress", "input", "--codec", "h265", "--crf", "52"], "between 1 and 51"),
+    ],
+)
+def test_cli_reports_av1_parameter_conflicts(
+    arguments: list[str], message: str, capsys
+) -> None:
+    assert main(arguments) == 1
+    assert message in capsys.readouterr().err
+
+
+def test_cli_parses_av1_parameters_independently() -> None:
+    from seqcomp.cli import _parser
+
+    args = _parser().parse_args(
+        [
+            "compress",
+            "input",
+            "--codec",
+            "av1",
+            "--crf",
+            "24",
+            "--av1-preset",
+            "8",
+            "--keyint",
+            "500",
+        ]
+    )
+    assert (args.codec, args.crf, args.av1_preset, args.keyint) == (
+        "av1",
+        24,
+        8,
+        500,
+    )
+
+
+def test_cli_reports_missing_svtav1_before_scanning_sources(
+    monkeypatch, capsys
+) -> None:
+    def missing_encoder(*, require_environment, required_encoders):
+        assert require_environment is True
+        assert required_encoders == ("libsvtav1",)
+        raise FFmpegCapabilityError(
+            "FFmpeg lacks required encoders: libsvtav1"
+        )
+
+    def unexpected_compression(*args, **kwargs):
+        raise AssertionError("source processing must not start")
+
+    monkeypatch.setattr("seqcomp.cli.inspect_ffmpeg", missing_encoder)
+    monkeypatch.setattr("seqcomp.cli.compress_path", unexpected_compression)
+    assert main(["compress", "input", "--codec", "av1"]) == 1
+    error = capsys.readouterr().err
+    assert "libsvtav1" in error
 
 
 def test_python_module_entrypoint() -> None:

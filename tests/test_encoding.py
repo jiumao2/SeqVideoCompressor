@@ -103,6 +103,74 @@ def test_gpu_settings_allow_cq_preset_device_and_keyint() -> None:
     assert arguments[arguments.index("-g") + 1] == "500"
 
 
+def test_av1_defaults_are_svtav1_crf28_preset6() -> None:
+    settings = make_settings(codec="av1")
+    assert settings.codec == "libsvtav1"
+    assert settings.codec_family == "av1"
+    assert settings.ffprobe_codec == "av1"
+    assert settings.crf == 28
+    assert settings.preset == 6
+    assert settings.keyint == 250
+    assert settings.name == "svtav1-crf28-preset6"
+    assert settings.ffmpeg_args() == [
+        "-vf",
+        "scale=in_range=full:out_range=full,format=yuv420p",
+        "-color_range",
+        "pc",
+        "-colorspace",
+        "bt470bg",
+        "-c:v",
+        "libsvtav1",
+        "-preset",
+        "6",
+        "-crf",
+        "28",
+        "-g",
+        "250",
+        "-pix_fmt",
+        "yuv420p",
+    ]
+    assert settings.manifest_encoding() == {
+        "mode": "cpu",
+        "codec": "libsvtav1",
+        "codec_family": "av1",
+        "quality_mode": "crf",
+        "preset": 6,
+        "keyint": 250,
+        "container": "matroska",
+        "audio": "none",
+        "crf": 28,
+        "profile": "main",
+        "pixel_format": "yuv420p",
+        "color_range": "pc",
+        "color_space": "bt470bg",
+    }
+
+
+def test_av1_allows_independent_quality_effort_and_keyint() -> None:
+    settings = make_settings(codec="av1", crf=24, av1_preset=8, keyint=500)
+    assert (settings.crf, settings.preset, settings.keyint) == (24, 8, 500)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"codec": "av1", "crf": 64}, "AV1 crf"),
+        ({"codec": "av1", "av1_preset": -1}, "AV1 preset"),
+        ({"codec": "av1", "av1_preset": 14}, "AV1 preset"),
+        ({"codec": "av1", "preset": "medium"}, "use --av1-preset"),
+        ({"codec": "h265", "av1_preset": 6}, "requires --codec av1"),
+        ({"gpu": True, "av1_preset": 6}, "cannot be used with --gpu"),
+        ({"codec": "av1", "gpu": True}, "only --codec h265"),
+    ],
+)
+def test_av1_rejects_invalid_or_conflicting_parameters(
+    kwargs: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        make_settings(**kwargs)
+
+
 def test_crf_zero_is_not_supported() -> None:
     with pytest.raises(ValueError, match="CRF 0"):
         make_settings(crf=0)
