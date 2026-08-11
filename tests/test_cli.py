@@ -24,7 +24,7 @@ def test_cli_version(capsys) -> None:
 def test_runtime_version_matches_project_metadata() -> None:
     pyproject = Path(__file__).parents[1] / "pyproject.toml"
     metadata = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    assert __version__ == metadata["project"]["version"] == "0.2.0"
+    assert __version__ == metadata["project"]["version"] == "0.2.1"
 
 
 @pytest.mark.parametrize(

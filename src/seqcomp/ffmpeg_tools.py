@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -11,6 +12,23 @@ from functools import lru_cache
 from pathlib import Path
 
 from .encoding import EncodingSettings
+
+
+_NVENC_REQUIRED_OPTIONS = (
+    "-preset",
+    "-tune",
+    "-profile",
+    "-rc",
+    "-cq",
+    "-multipass",
+    "-rc-lookahead",
+    "-spatial-aq",
+    "-temporal-aq",
+    "-aq-strength",
+    "-no-scenecut",
+    "-b_ref_mode",
+    "-gpu",
+)
 
 
 class FFmpegCapabilityError(RuntimeError):
@@ -76,6 +94,29 @@ def _capture_text(command: list[str], label: str) -> str:
     raise FFmpegCapabilityError(f"{label} returned no output")
 
 
+def _encoder_option_names(details: str) -> set[str]:
+    return set(re.findall(r"(?m)^\s*(-[A-Za-z0-9_-]+)(?:\s|$)", details))
+
+
+def _missing_encoder_capabilities(encoder: str, details: str) -> list[str]:
+    if encoder == "hevc_nvenc":
+        available_options = _encoder_option_names(details)
+        missing = [
+            option
+            for option in _NVENC_REQUIRED_OPTIONS
+            if option not in available_options
+        ]
+        if "yuv420p" not in details:
+            missing.append("yuv420p")
+        return missing
+    required_text = (
+        ("yuv420p", "-crf", "-preset")
+        if encoder == "libsvtav1"
+        else ("gray",)
+    )
+    return [item for item in required_text if item not in details]
+
+
 @lru_cache(maxsize=8)
 def inspect_ffmpeg(
     *,
@@ -113,13 +154,7 @@ def inspect_ffmpeg(
             [str(ffmpeg), "-hide_banner", "-h", f"encoder={encoder}"],
             f"{encoder} capability probe",
         )
-        if encoder == "hevc_nvenc":
-            required_text = ("yuv420p", "-cq", "-gpu")
-        elif encoder == "libsvtav1":
-            required_text = ("yuv420p", "-crf", "-preset")
-        else:
-            required_text = ("gray",)
-        absent = [item for item in required_text if item not in details]
+        absent = _missing_encoder_capabilities(encoder, details)
         if absent:
             raise FFmpegCapabilityError(
                 f"{encoder} lacks required capabilities: {', '.join(absent)}"
@@ -148,6 +183,21 @@ def _nvidia_diagnostics() -> str:
 
 def _gpu_failure_reason(stderr: str) -> str:
     lowered = stderr.lower()
+    if "lacks required encoders" in lowered:
+        return (
+            "The environment-local FFmpeg does not provide the required "
+            "hevc_nvenc encoder."
+        )
+    if "lacks required capabilities" in lowered:
+        return (
+            "The environment-local FFmpeg provides hevc_nvenc but does not "
+            "expose every NVENC option required by seqcomp."
+        )
+    if "unrecognized option" in lowered or "option not found" in lowered:
+        return (
+            "The environment-local FFmpeg rejected a required NVENC option; "
+            "its encoder interface is incompatible with this seqcomp build."
+        )
     if "required nvenc api version" in lowered or "driver does not support" in lowered:
         return "The NVIDIA driver is too old for this FFmpeg/NVENC API."
     if "cannot load nvcuda" in lowered or "cannot load libcuda" in lowered:
@@ -218,12 +268,7 @@ def inspect_nvenc(
             required_encoders=("hevc_nvenc",),
         )
     except (FFmpegCapabilityError, OSError, subprocess.SubprocessError) as exc:
-        raise _gpu_error(
-            runtime,
-            settings,
-            str(exc),
-            "The environment-local FFmpeg does not provide the required hevc_nvenc encoder.",
-        ) from exc
+        raise _gpu_error(runtime, settings, str(exc)) from exc
     command = [
         str(runtime.ffmpeg),
         "-hide_banner",
