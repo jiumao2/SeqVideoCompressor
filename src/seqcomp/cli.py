@@ -9,14 +9,16 @@ from . import __version__
 from .core import (
     DEFAULT_COMPRESSION_RATIO,
     DEFAULT_ENCODING_TIME_RATIO,
+    GPU_COMPRESSION_RATIO,
+    GPU_ENCODING_TIME_RATIO,
     CompressionSummary,
     compress_path,
     format_duration,
     format_gb,
     status_report,
 )
-from .encoding import CODEC_NAMES, PRESETS, make_settings
-from .ffmpeg_tools import inspect_ffmpeg
+from .encoding import CODEC_NAMES, GPU_PRESETS, PRESETS, make_settings
+from .ffmpeg_tools import inspect_ffmpeg, inspect_nvenc
 from .seq_reader import SeqReader
 
 
@@ -55,20 +57,44 @@ def _add_codec_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--crf",
         type=_bounded_int("CRF", 1, 51),
-        default=18,
-        help="quality level; lower is higher quality/larger (default: 18)",
+        default=None,
+        help="CPU quality level; lower is higher quality/larger (default: 18)",
     )
     parser.add_argument(
         "--preset",
         choices=PRESETS,
-        default="medium",
-        help="encoding effort/speed tradeoff (default: medium)",
+        default=None,
+        help="CPU encoding effort/speed tradeoff (default: medium)",
     )
     parser.add_argument(
         "--keyint",
         type=_bounded_int("keyint", 1),
         default=250,
         help="maximum keyframe interval in frames (default: 250)",
+    )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="use NVIDIA H.265 NVENC instead of CPU encoding",
+    )
+    parser.add_argument(
+        "--cq",
+        type=_bounded_int("CQ", 1, 51),
+        default=None,
+        help="NVENC quality level; lower is higher quality/larger (default: 28)",
+    )
+    parser.add_argument(
+        "--gpu-preset",
+        choices=GPU_PRESETS,
+        default=None,
+        help="NVENC encoding effort preset (default: p5)",
+    )
+    parser.add_argument(
+        "--gpu-device",
+        type=_bounded_int("GPU device", 0),
+        default=None,
+        metavar="INDEX",
+        help="zero-based NVIDIA GPU index (default: automatic)",
     )
 
 
@@ -85,21 +111,35 @@ def _parser() -> argparse.ArgumentParser:
     )
     status_parser.add_argument("input", type=Path)
     status_parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="estimate NVIDIA NVENC compression and verify GPU support",
+    )
+    status_parser.add_argument(
+        "--gpu-device",
+        type=_bounded_int("GPU device", 0),
+        default=None,
+        metavar="INDEX",
+        help="zero-based NVIDIA GPU index (default: automatic)",
+    )
+    status_parser.add_argument(
         "--ratio",
         type=_positive_float("ratio"),
-        default=DEFAULT_COMPRESSION_RATIO,
+        default=None,
         help=(
-            "assumed compression ratio for raw-only recordings "
-            f"(default: {DEFAULT_COMPRESSION_RATIO:g})"
+            "assumed compression ratio for raw-only recordings; "
+            f"defaults to {DEFAULT_COMPRESSION_RATIO:g} for CPU or "
+            f"{GPU_COMPRESSION_RATIO:g} for GPU"
         ),
     )
     status_parser.add_argument(
         "--time-ratio",
         type=_positive_float("time ratio"),
-        default=DEFAULT_ENCODING_TIME_RATIO,
+        default=None,
         help=(
-            "assumed encoding time divided by video duration "
-            f"(default: {DEFAULT_ENCODING_TIME_RATIO:g})"
+            "assumed encoding time divided by video duration; "
+            f"defaults to {DEFAULT_ENCODING_TIME_RATIO:g} for CPU or "
+            f"{GPU_ENCODING_TIME_RATIO:g} for GPU"
         ),
     )
 
@@ -115,12 +155,6 @@ def _parser() -> argparse.ArgumentParser:
         "--dest", type=Path, help="mirror-backup destination (default: in place)"
     )
     _add_codec_arguments(compress_parser)
-    compress_parser.add_argument(
-        "--pipeline",
-        choices=("jpeg-pipe", "opencv-raw", "direct-seq"),
-        default="jpeg-pipe",
-        help="SEQ input pipeline (default: jpeg-pipe)",
-    )
     compress_parser.add_argument(
         "--delete",
         action="store_true",
@@ -186,25 +220,57 @@ def _print_compression_summary(
 
 def _run(args: argparse.Namespace) -> int:
     if args.command == "status":
+        if args.gpu_device is not None and not args.gpu:
+            raise ValueError("--gpu-device requires --gpu")
+        compression_ratio = (
+            args.ratio
+            if args.ratio is not None
+            else (GPU_COMPRESSION_RATIO if args.gpu else DEFAULT_COMPRESSION_RATIO)
+        )
+        encoding_time_ratio = (
+            args.time_ratio
+            if args.time_ratio is not None
+            else (GPU_ENCODING_TIME_RATIO if args.gpu else DEFAULT_ENCODING_TIME_RATIO)
+        )
+        if args.gpu:
+            print("Checking NVIDIA H.265 NVENC support ...", file=sys.stderr)
+            gpu_settings = make_settings(gpu=True, gpu_device=args.gpu_device)
+            inspect_nvenc(gpu_settings, require_environment=True)
         print(f"Scanning {args.input} ...", file=sys.stderr)
-        print(status_report(args.input, args.ratio, args.time_ratio))
+        print(status_report(args.input, compression_ratio, encoding_time_ratio))
         return 0
     if args.command == "inspect":
         print(f"Inspecting {args.input} ...", file=sys.stderr)
         _json_print(SeqReader(args.input).inspect(args.samples))
         return 0
 
-    if not args.quiet:
-        print("Checking the environment-local FFmpeg runtime ...", file=sys.stderr)
-    runtime = inspect_ffmpeg(require_environment=True)
     if args.command == "compress":
-        settings = make_settings(args.codec, args.crf, args.preset, args.keyint)
+        settings = make_settings(
+            args.codec,
+            args.crf,
+            args.preset,
+            args.keyint,
+            gpu=args.gpu,
+            cq=args.cq,
+            gpu_preset=args.gpu_preset,
+            gpu_device=args.gpu_device,
+        )
+        if not args.quiet:
+            label = "NVIDIA H.265 NVENC" if settings.is_gpu else settings.codec
+            print(f"Checking the environment-local FFmpeg runtime ({label}) ...", file=sys.stderr)
+        runtime = (
+            inspect_nvenc(settings, require_environment=True)
+            if settings.is_gpu
+            else inspect_ffmpeg(
+                require_environment=True,
+                required_encoders=(settings.codec,),
+            )
+        )
         summary = compress_path(
             args.input,
             runtime,
             settings,
             dest=args.dest,
-            pipeline=args.pipeline,
             delete=args.delete,
             dry_run=args.dry_run,
             force=args.force,

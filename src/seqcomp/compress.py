@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 from tqdm.auto import tqdm
 
-from .encode import PIPELINES, _follow_ffmpeg_progress, encode_segment
+from .encode import _follow_ffmpeg_progress, encode_segment
 from .encoding import EncodingSettings
 from .ffmpeg_tools import FFmpegRuntime, probe_video
 from .naming import OutputPaths, output_paths
@@ -125,19 +125,39 @@ def _validate_full_decode(
         )
 
 
+def _video_probe_error(
+    settings: EncodingSettings, probe: Mapping[str, object]
+) -> str | None:
+    if int(probe.get("audio_stream_count", -1)) != 0:
+        return "output contains an audio stream"
+    if int(probe.get("stream_count", -1)) != 1:
+        return "output must contain exactly one video stream"
+    if probe.get("codec_name") != settings.ffprobe_codec:
+        return "video codec mismatch"
+    if settings.codec == "libx265" and probe.get("pix_fmt") != "gray":
+        return "CPU HEVC pixel format is not gray"
+    if settings.is_gpu:
+        if probe.get("profile") != "Main":
+            return "NVENC HEVC profile is not Main"
+        if probe.get("pix_fmt") not in {"yuv420p", "yuvj420p"}:
+            return "NVENC HEVC pixel format is not 8-bit 4:2:0"
+        if probe.get("color_range") != "pc":
+            return "NVENC HEVC color range is not full-range (pc)"
+        if probe.get("color_space") != "bt470bg":
+            return "NVENC HEVC color space is not bt470bg"
+    return None
+
+
 def compress_recording(
     seq_path: str | Path,
     output_dir: str | Path | None,
     runtime: FFmpegRuntime,
     settings: EncodingSettings,
     *,
-    pipeline: str = "jpeg-pipe",
     overwrite: bool = False,
     show_progress: bool = False,
 ) -> OutputPaths:
     """Create a canonical MKV, timestamp sidecar, and archival manifest."""
-    if pipeline not in PIPELINES:
-        raise ValueError(f"Unknown pipeline: {pipeline}")
     input_seq_path = Path(seq_path)
     input_idx_path = Path(f"{input_seq_path}.idx")
     initial_source_state = (
@@ -147,6 +167,15 @@ def compress_recording(
     if show_progress:
         print("  [read]     validating SEQ/IDX structure and JPEG samples")
     reader = SeqReader(seq_path)
+    if settings.is_gpu and (
+        reader.header.width % 2 != 0 or reader.header.height % 2 != 0
+    ):
+        raise ValueError(
+            "NVIDIA HEVC Main/yuv420p requires even frame dimensions, but "
+            f"{reader.header.width}x{reader.header.height} was requested. "
+            "seqcomp will not pad or resize scientific video frames; omit --gpu "
+            "to use native-gray CPU H.265 encoding."
+        )
     jpeg_samples_checked = reader.validate_jpeg_samples(25)
     _require_unchanged_source(
         reader.seq_path,
@@ -184,7 +213,6 @@ def compress_recording(
         runtime,
         settings,
         outputs,
-        pipeline=pipeline,
         start=0,
         count=reader.frame_count,
         overwrite=overwrite,
@@ -196,12 +224,9 @@ def compress_recording(
     probe = encoded.probe
     if show_progress:
         print("  [verify]   checking streams, packets, timestamps, and full decode")
-    if int(probe.get("audio_stream_count", -1)) != 0:
-        raise RuntimeError(f"Output unexpectedly contains audio: {outputs.video}")
-    if int(probe.get("stream_count", -1)) != 1:
-        raise RuntimeError(f"Output must contain exactly one video stream: {probe}")
-    if settings.codec == "libx265" and probe.get("pix_fmt") != "gray":
-        raise RuntimeError(f"Expected native gray HEVC output, got: {probe}")
+    probe_error = _video_probe_error(settings, probe)
+    if probe_error:
+        raise RuntimeError(f"{probe_error}: {probe}")
     if (int(probe.get("width", -1)), int(probe.get("height", -1))) != (
         reader.header.width,
         reader.header.height,
@@ -249,7 +274,7 @@ def compress_recording(
     output_data_bytes = outputs.video.stat().st_size + outputs.timestamps.stat().st_size
     source_duration_seconds = reader.frame_count / reader.header.frame_rate
     manifest = {
-        "schema_version": 2,
+        "schema_version": 3,
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "source": {
             "seq_path": str(reader.seq_path.resolve()),
@@ -258,14 +283,7 @@ def compress_recording(
             "idx_bytes": reader.idx_path.stat().st_size,
             **source_hashes,
         },
-        "encoding": {
-            "codec": settings.codec,
-            "preset": settings.preset,
-            "crf": settings.crf,
-            "keyint": settings.keyint,
-            "container": "matroska",
-            "audio": "none",
-        },
+        "encoding": settings.manifest_encoding(),
         "video": {
             "path": str(outputs.video.resolve()),
             "bytes": outputs.video.stat().st_size,
@@ -296,11 +314,7 @@ def compress_recording(
         "validation": {
             "jpeg_samples_checked": len(jpeg_samples_checked),
             "jpeg_sample_indices": jpeg_samples_checked,
-            "jpeg_frames_validated_during_encoding": (
-                reader.frame_count
-                if pipeline in {"jpeg-pipe", "opencv-raw"}
-                else len(jpeg_samples_checked)
-            ),
+            "jpeg_frames_validated_during_encoding": reader.frame_count,
             "idx_structure_valid": True,
             "timestamps_exact": True,
             "video_packet_count_exact": True,
@@ -341,16 +355,13 @@ def verify_existing_package(
         for section in required_sections:
             if not isinstance(manifest.get(section), Mapping):
                 return False, f"manifest section {section!r} must be a JSON object", outputs
-        expected_encoding = {
-            "codec": settings.codec,
-            "preset": settings.preset,
-            "crf": settings.crf,
-            "keyint": settings.keyint,
-        }
+        schema_version = int(manifest.get("schema_version", -1))
         recorded_encoding = manifest["encoding"]
-        for key, value in expected_encoding.items():
-            if recorded_encoding.get(key) != value:
-                return False, f"parameter mismatch: {key}", outputs
+        matches, mismatch = settings.manifest_matches(
+            recorded_encoding, schema_version
+        )
+        if not matches:
+            return False, f"parameter mismatch: {mismatch}", outputs
         if show_progress:
             print("  [verify]   calculating source and package SHA-256")
         if manifest["source"].get("seq_sha256") != sha256_file(
@@ -385,13 +396,9 @@ def verify_existing_package(
         if show_progress:
             print("  [verify]   checking video streams, dimensions, and packet count")
         probe = probe_video(runtime, outputs.video)
-        if int(probe.get("stream_count", -1)) != 1 or int(probe.get("audio_stream_count", -1)) != 0:
-            return False, "output must contain one video stream and no audio", outputs
-        expected_codec = "hevc" if settings.codec == "libx265" else "h264"
-        if probe.get("codec_name") != expected_codec:
-            return False, "video codec mismatch", outputs
-        if settings.codec == "libx265" and probe.get("pix_fmt") != "gray":
-            return False, "HEVC pixel format is not gray", outputs
+        probe_error = _video_probe_error(settings, probe)
+        if probe_error:
+            return False, probe_error, outputs
         if (int(probe.get("width", -1)), int(probe.get("height", -1))) != (
             reader.header.width,
             reader.header.height,
@@ -399,6 +406,12 @@ def verify_existing_package(
             return False, "video dimensions do not match SEQ header", outputs
         if _count_video_packets(runtime, outputs.video) != reader.frame_count:
             return False, "video packet count mismatch", outputs
+        _validate_full_decode(
+            runtime,
+            outputs.video,
+            reader.frame_count,
+            show_progress=show_progress,
+        )
     except (
         AttributeError,
         KeyError,

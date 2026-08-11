@@ -20,6 +20,8 @@ from .seq_reader import SeqReader
 FOLDER_MANIFEST_NAME = ".seqcomp_manifest.json"
 DEFAULT_COMPRESSION_RATIO = 20.0
 DEFAULT_ENCODING_TIME_RATIO = 1.2
+GPU_COMPRESSION_RATIO = 10.0
+GPU_ENCODING_TIME_RATIO = 0.25
 
 
 @dataclass(frozen=True)
@@ -270,7 +272,6 @@ def compress_path(
     settings: EncodingSettings,
     *,
     dest: str | Path | None = None,
-    pipeline: str = "jpeg-pipe",
     delete: bool = False,
     dry_run: bool = False,
     force: bool = False,
@@ -369,7 +370,6 @@ def compress_path(
                     output_dir,
                     runtime,
                     settings,
-                    pipeline=pipeline,
                     overwrite=exists or force,
                     show_progress=not quiet,
                 )

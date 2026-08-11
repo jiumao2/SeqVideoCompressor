@@ -1,2 +1,3 @@
 include README_ZH.md
 include environment.yml
+include tests/conftest.py

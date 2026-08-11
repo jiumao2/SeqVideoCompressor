@@ -23,7 +23,7 @@ def test_cli_version(capsys) -> None:
 def test_runtime_version_matches_project_metadata() -> None:
     pyproject = Path(__file__).parents[1] / "pyproject.toml"
     metadata = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    assert __version__ == metadata["project"]["version"] == "0.1.0"
+    assert __version__ == metadata["project"]["version"] == "0.2.0"
 
 
 @pytest.mark.parametrize(
@@ -33,6 +33,9 @@ def test_runtime_version_matches_project_metadata() -> None:
         ["compress", "input", "--crf", "0"],
         ["compress", "input", "--keyint", "0"],
         ["compress", "input", "--codec", "vp9"],
+        ["compress", "input", "--cq", "0"],
+        ["compress", "input", "--gpu-device", "-1"],
+        ["compress", "input", "--pipeline", "jpeg-pipe"],
     ],
 )
 def test_cli_rejects_invalid_codec_parameters(arguments: list[str]) -> None:
@@ -52,6 +55,25 @@ def test_cli_rejects_invalid_status_estimates(arguments: list[str]) -> None:
     with pytest.raises(SystemExit) as exc_info:
         main(arguments)
     assert exc_info.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (["compress", "input", "--gpu", "--codec", "h264"], "only --codec h265"),
+        (["compress", "input", "--gpu", "--crf", "18"], "--crf is CPU-only"),
+        (["compress", "input", "--gpu", "--preset", "medium"], "--preset is CPU-only"),
+        (["compress", "input", "--cq", "28"], "require --gpu"),
+        (["compress", "input", "--gpu-preset", "p5"], "require --gpu"),
+        (["compress", "input", "--gpu-device", "0"], "require --gpu"),
+        (["status", "input", "--gpu-device", "0"], "requires --gpu"),
+    ],
+)
+def test_cli_reports_gpu_parameter_conflicts(
+    arguments: list[str], message: str, capsys
+) -> None:
+    assert main(arguments) == 1
+    assert message in capsys.readouterr().err
 
 
 def test_python_module_entrypoint() -> None:
@@ -82,6 +104,41 @@ def test_cli_status_is_human_readable_and_aggregated(
     assert "Summary" in output
     assert "GB" in output
     assert "estimated encoding:" in output
+
+
+def test_cli_gpu_status_uses_gpu_estimates(tmp_path: Path, monkeypatch, capsys) -> None:
+    source = tmp_path / "source"
+    create_test_seq(source)
+    monkeypatch.setattr("seqcomp.cli.inspect_nvenc", lambda *args, **kwargs: None)
+    code = main(["status", str(source), "--gpu"])
+    assert code == 0
+    captured = capsys.readouterr()
+    assert "10x compression" in captured.out
+    assert "0.25x video duration" in captured.out
+    assert "Checking NVIDIA H.265 NVENC support" in captured.err
+
+
+def test_cli_gpu_status_allows_estimate_overrides(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    source = tmp_path / "source"
+    create_test_seq(source)
+    monkeypatch.setattr("seqcomp.cli.inspect_nvenc", lambda *args, **kwargs: None)
+    code = main(
+        [
+            "status",
+            str(source),
+            "--gpu",
+            "--ratio",
+            "12",
+            "--time-ratio",
+            "0.4",
+        ]
+    )
+    assert code == 0
+    output = capsys.readouterr().out
+    assert "12x compression" in output
+    assert "0.4x video duration" in output
 
 
 @pytest.mark.integration

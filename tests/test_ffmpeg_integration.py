@@ -23,7 +23,7 @@ def test_lossy_codecs_support_odd_gray_frames_without_audio(
     reader = SeqReader(tiny_seq)
     settings = make_settings(codec=codec)
     outputs = output_paths(tiny_seq, tmp_path)
-    result = encode_segment(reader, runtime, settings, outputs, pipeline="jpeg-pipe")
+    result = encode_segment(reader, runtime, settings, outputs)
     assert result.frame_count == reader.frame_count
     assert result.probe["audio_stream_count"] == 0
     assert result.probe["stream_count"] == 1
@@ -32,16 +32,11 @@ def test_lossy_codecs_support_odd_gray_frames_without_audio(
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("pipeline", ["jpeg-pipe", "opencv-raw", "direct-seq"])
-def test_all_input_pipelines_create_decodable_h265(
-    tiny_seq: Path, tmp_path: Path, pipeline: str
-) -> None:
+def test_jpeg_pipe_creates_decodable_h265(tiny_seq: Path, tmp_path: Path) -> None:
     runtime = inspect_ffmpeg(require_environment=True)
     reader = SeqReader(tiny_seq)
     outputs = output_paths(tiny_seq, tmp_path)
-    result = encode_segment(
-        reader, runtime, DEFAULT_SETTINGS, outputs, pipeline=pipeline
-    )
+    result = encode_segment(reader, runtime, DEFAULT_SETTINGS, outputs)
     assert result.frame_count == reader.frame_count
     assert result.probe["codec_name"] == "hevc"
     assert result.probe["audio_stream_count"] == 0
@@ -63,7 +58,10 @@ def test_default_compress_package_is_gray_hevc_without_audio(
     assert outputs.video.name == "test-recording.000.mkv"
     assert outputs.timestamps.name == "test-recording.000.timestamps.npy"
     assert manifest["encoding"] == {
+        "mode": "cpu",
         "codec": "libx265",
+        "codec_family": "h265",
+        "quality_mode": "crf",
         "preset": "medium",
         "crf": 18,
         "keyint": 250,
@@ -83,6 +81,29 @@ def test_default_compress_package_is_gray_hevc_without_audio(
     assert manifest["compression"]["encoding_time_to_video_time"] > 0
     assert manifest["source"]["seq_sha256"]
     assert manifest["video"]["video_sha256"]
+
+
+@pytest.mark.integration
+def test_schema2_cpu_manifest_remains_verifiable(
+    tiny_seq: Path, tmp_path: Path
+) -> None:
+    runtime = inspect_ffmpeg(require_environment=True)
+    outputs = compress_recording(tiny_seq, tmp_path, runtime, DEFAULT_SETTINGS)
+    manifest = json.loads(outputs.manifest.read_text(encoding="utf-8"))
+    manifest["schema_version"] = 2
+    manifest["encoding"] = {
+        "codec": "libx265",
+        "preset": "medium",
+        "crf": 18,
+        "keyint": 250,
+        "container": "matroska",
+        "audio": "none",
+    }
+    outputs.manifest.write_text(json.dumps(manifest), encoding="utf-8")
+    verified, reason, _ = verify_existing_package(
+        tiny_seq, tmp_path, runtime, DEFAULT_SETTINGS
+    )
+    assert verified, reason
 
 
 @pytest.mark.integration
