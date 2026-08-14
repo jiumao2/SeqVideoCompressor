@@ -2,16 +2,22 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import tempfile
+import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable, Iterator
 
-from .compress import compress_recording, verify_existing_package
+from .compress import (
+    compress_recording,
+    verify_existing_package,
+    verify_standalone_package,
+)
 from .ffmpeg_tools import FFmpegRuntime
-from .naming import output_paths
+from .naming import OutputPaths, output_paths
 from .encoding import EncodingSettings
 from .runtime_utils import atomic_write_json, copy_file_with_progress, sha256_file
 from .seq_reader import SeqReader
@@ -22,6 +28,10 @@ DEFAULT_COMPRESSION_RATIO = 20.0
 DEFAULT_ENCODING_TIME_RATIO = 1.2
 GPU_COMPRESSION_RATIO = 10.0
 GPU_ENCODING_TIME_RATIO = 0.25
+TEMPORARY_MINIMUM_AGE_SECONDS = 24 * 60 * 60
+_TEMPORARY_VIDEO_PATTERN = re.compile(
+    r"^\.(?P<stem>.+)\.(?P<token>[a-z0-9_]{8})\.seqcomp\.tmp\.mkv$"
+)
 
 
 @dataclass(frozen=True)
@@ -50,6 +60,9 @@ class CompressionSummary:
     output_bytes: int = 0
     encoding_seconds: float = 0.0
     video_seconds: float = 0.0
+    temporary_cleaned: int = 0
+    temporary_kept: int = 0
+    temporary_bytes_cleaned: int = 0
 
     @property
     def ok(self) -> bool:
@@ -88,6 +101,157 @@ def iter_seq_pairs(folder: str | Path) -> Iterator[SeqPair]:
         idx = Path(f"{seq}.idx")
         if idx.is_file():
             yield SeqPair(seq, idx)
+
+
+def _temporary_video_stem(path: Path) -> str | None:
+    match = _TEMPORARY_VIDEO_PATTERN.fullmatch(path.name)
+    return match.group("stem") if match else None
+
+
+def _temporary_videos(root: Path) -> list[Path]:
+    if not root.is_dir():
+        return []
+    return sorted(
+        (
+            path
+            for path in root.rglob("*.seqcomp.tmp.mkv")
+            if path.is_file() and _temporary_video_stem(path) is not None
+        ),
+        key=lambda path: str(path).lower(),
+    )
+
+
+def _completed_outputs_for_temporary(path: Path) -> tuple[Path, OutputPaths]:
+    stem = _temporary_video_stem(path)
+    if stem is None:
+        raise ValueError(f"Not a seqcomp temporary video: {path}")
+    seq_path = path.with_name(f"{stem}.seq")
+    return seq_path, output_paths(seq_path, path.parent)
+
+
+def _verify_source_hashes_if_present(
+    seq_path: Path,
+    manifest: Mapping[str, object],
+    *,
+    show_progress: bool,
+) -> tuple[bool, str]:
+    idx_path = Path(f"{seq_path}.idx")
+    if seq_path.is_file() != idx_path.is_file():
+        return False, "only one of the source SEQ/IDX files exists"
+    if not seq_path.is_file():
+        return True, "source pair absent"
+    source = manifest.get("source")
+    if not isinstance(source, Mapping):
+        return False, "manifest source section is invalid"
+    if source.get("seq_sha256") != sha256_file(
+        seq_path,
+        show_progress=show_progress,
+        description=f"Hash source {seq_path.name}",
+    ):
+        return False, "source SEQ SHA-256 mismatch"
+    if source.get("idx_sha256") != sha256_file(
+        idx_path,
+        show_progress=show_progress,
+        description=f"Hash source {idx_path.name}",
+    ):
+        return False, "source IDX SHA-256 mismatch"
+    return True, "source hashes verified"
+
+
+def _cleanup_temporary_videos(
+    root: Path,
+    runtime: FFmpegRuntime,
+    *,
+    dry_run: bool,
+    show_progress: bool,
+    current_time: float | None = None,
+) -> tuple[int, int, int]:
+    now = time.time() if current_time is None else current_time
+    cleaned = 0
+    kept = 0
+    cleaned_bytes = 0
+    temporary_files = _temporary_videos(root)
+    if show_progress:
+        print(
+            f"[cleanup]  checking {len(temporary_files)} seqcomp temporary video(s)"
+        )
+    for temporary in temporary_files:
+        relative = temporary.relative_to(root)
+        try:
+            initial = _snapshot(temporary)
+        except OSError as exc:
+            kept += 1
+            if show_progress:
+                print(f"[keep-temp] {relative}: cannot inspect temporary file: {exc}")
+            continue
+        age_seconds = max(now - initial.mtime_ns / 1_000_000_000, 0.0)
+        if age_seconds < TEMPORARY_MINIMUM_AGE_SECONDS:
+            kept += 1
+            if show_progress:
+                remaining = TEMPORARY_MINIMUM_AGE_SECONDS - age_seconds
+                print(
+                    f"[keep-temp] {relative}: newer than 24 h "
+                    f"({format_duration(remaining)} remaining)"
+                )
+            continue
+        seq_path, outputs = _completed_outputs_for_temporary(temporary)
+        verified, reason, manifest = verify_standalone_package(
+            outputs,
+            runtime,
+            show_progress=show_progress,
+        )
+        if not verified or manifest is None:
+            kept += 1
+            if show_progress:
+                print(
+                    f"[keep-temp] {relative}: completed package not verified: "
+                    f"{reason}"
+                )
+            continue
+        source_verified, source_reason = _verify_source_hashes_if_present(
+            seq_path,
+            manifest,
+            show_progress=show_progress,
+        )
+        if not source_verified:
+            kept += 1
+            if show_progress:
+                print(f"[keep-temp] {relative}: {source_reason}")
+            continue
+        try:
+            unchanged = _snapshot(temporary) == initial
+        except OSError as exc:
+            kept += 1
+            if show_progress:
+                print(f"[keep-temp] {relative}: cannot recheck temporary file: {exc}")
+            continue
+        if not unchanged:
+            kept += 1
+            if show_progress:
+                print(
+                    f"[keep-temp] {relative}: temporary file changed during "
+                    "verification"
+                )
+            continue
+        size = initial.size
+        if dry_run:
+            cleaned += 1
+            cleaned_bytes += size
+            if show_progress:
+                print(f"[clean-temp] {relative} ({format_gb(size)}, dry run)")
+            continue
+        try:
+            temporary.unlink()
+        except OSError as exc:
+            kept += 1
+            if show_progress:
+                print(f"[keep-temp] {relative}: removal failed: {exc}")
+            continue
+        cleaned += 1
+        cleaned_bytes += size
+        if show_progress:
+            print(f"[clean-temp] {relative} ({format_gb(size)} removed)")
+    return cleaned, kept, cleaned_bytes
 
 
 def _is_within(path: Path, parent: Path) -> bool:
@@ -277,6 +441,7 @@ def compress_path(
     force: bool = False,
     yes: bool = False,
     quiet: bool = False,
+    cleanup_temp: bool = False,
     input_fn: Callable[[str], str] = input,
 ) -> CompressionSummary:
     source = Path(input_path).resolve()
@@ -286,14 +451,6 @@ def compress_path(
     if is_file and source.suffix.lower() != ".seq":
         raise ValueError(f"Expected a .seq file or folder, got: {source}")
     root = source.parent if is_file else source
-    if not quiet:
-        print(f"[scan]     {source}")
-    pairs = [SeqPair(source, Path(f"{source}.idx"))] if is_file else list(iter_seq_pairs(root))
-    if is_file and not pairs[0].idx.is_file():
-        raise FileNotFoundError(pairs[0].idx)
-    if not pairs:
-        raise ValueError(f"No .seq + .seq.idx pairs found under {source}")
-
     destination_root = Path(dest).resolve() if dest is not None else None
     if destination_root is not None:
         if not is_file and (
@@ -305,6 +462,27 @@ def compress_path(
         if destination_root.exists() and any(destination_root.iterdir()):
             if not _confirm(f"Destination {destination_root} is not empty; continue?", yes=yes, input_fn=input_fn):
                 raise RuntimeError("Destination confirmation declined")
+    if not quiet:
+        print(f"[scan]     {source}")
+    pairs = [SeqPair(source, Path(f"{source}.idx"))] if is_file else list(iter_seq_pairs(root))
+    if is_file and not pairs[0].idx.is_file():
+        raise FileNotFoundError(pairs[0].idx)
+    summary = CompressionSummary()
+    if cleanup_temp:
+        cleanup_root = destination_root if destination_root is not None else root
+        cleaned, kept, cleaned_bytes = _cleanup_temporary_videos(
+            cleanup_root,
+            runtime,
+            dry_run=dry_run,
+            show_progress=not quiet,
+        )
+        summary.temporary_cleaned = cleaned
+        summary.temporary_kept = kept
+        summary.temporary_bytes_cleaned = cleaned_bytes
+    if not pairs:
+        if cleanup_temp:
+            return summary
+        raise ValueError(f"No .seq + .seq.idx pairs found under {source}")
     if not dry_run:
         if not quiet:
             print(f"[space]    checking free space for {len(pairs)} recording(s)")
@@ -316,7 +494,6 @@ def compress_path(
             delete=delete,
         )
 
-    summary = CompressionSummary()
     recordings: dict[str, object] = {}
     copy_records: dict[str, object] = {}
     for pair in pairs:
@@ -510,6 +687,8 @@ def status_path(input_path: str | Path) -> list[dict[str, object]]:
         for path in root.rglob("*"):
             if not path.is_file() or path.name == FOLDER_MANIFEST_NAME:
                 continue
+            if _temporary_video_stem(path) is not None:
+                continue
             relative = path.relative_to(root).as_posix()
             for suffix in suffixes:
                 if relative.endswith(suffix):
@@ -593,6 +772,7 @@ def status_report(
         raise ValueError("encoding time ratio must be greater than zero")
     source = Path(input_path).resolve()
     rows = status_path(source)
+    temporary_files = _temporary_videos(source) if source.is_dir() else []
     lines = [
         f"Status: {source}",
         (
@@ -698,4 +878,21 @@ def status_report(
             ),
         ]
     )
+    if temporary_files:
+        temporary_bytes = sum(path.stat().st_size for path in temporary_files)
+        lines.extend(
+            [
+                "",
+                "Temporary files",
+                (
+                    f"  Detected: {len(temporary_files)} | "
+                    f"size {format_gb(temporary_bytes)}"
+                ),
+                (
+                    "  These files are excluded from recording counts. Run "
+                    f"seqcomp compress \"{source}\" --cleanup-temp to verify "
+                    "and remove stale files."
+                ),
+            ]
+        )
     return "\n".join(lines)

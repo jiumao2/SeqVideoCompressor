@@ -168,6 +168,13 @@ def _parser() -> argparse.ArgumentParser:
         help="delete each source SEQ/IDX pair immediately after verification",
     )
     compress_parser.add_argument(
+        "--cleanup-temp",
+        action="store_true",
+        help=(
+            "verify and remove stale seqcomp temporary videos older than 24 hours"
+        ),
+    )
+    compress_parser.add_argument(
         "--dry-run", action="store_true", help="show planned actions without writing"
     )
     compress_parser.add_argument(
@@ -191,16 +198,30 @@ def _print_compression_summary(
     if dry_run:
         print(
             f"Dry run: compress {summary.compressed}, copy {summary.copied}, "
-            f"skip {summary.skipped}, conflicts {summary.conflict_skipped}."
+            f"clean-temp {summary.temporary_cleaned}, "
+            f"keep-temp {summary.temporary_kept}, skip {summary.skipped}, "
+            f"conflicts {summary.conflict_skipped}."
         )
+        if summary.temporary_bytes_cleaned:
+            print(
+                f"Temporary cleanup: "
+                f"{format_gb(summary.temporary_bytes_cleaned)} eligible."
+            )
         return
     label = "Done" if summary.ok else "Finished with errors"
     print(
         f"{label}: compressed {summary.compressed}, copied {summary.copied}, "
         f"skipped {summary.skipped}, conflict-skipped "
         f"{summary.conflict_skipped}, deleted {summary.deleted}, "
+        f"cleaned-temp {summary.temporary_cleaned}, "
+        f"kept-temp {summary.temporary_kept}, "
         f"failed {summary.failed}."
     )
+    if summary.temporary_bytes_cleaned:
+        print(
+            f"Temporary cleanup: {format_gb(summary.temporary_bytes_cleaned)} "
+            "removed."
+        )
     if summary.source_bytes:
         saved_bytes = summary.source_bytes - summary.output_bytes
         ratio = (
@@ -284,6 +305,7 @@ def _run(args: argparse.Namespace) -> int:
             force=args.force,
             yes=args.yes,
             quiet=args.quiet,
+            cleanup_temp=args.cleanup_temp,
         )
         _print_compression_summary(summary, dry_run=args.dry_run)
         return 0 if summary.ok else 1

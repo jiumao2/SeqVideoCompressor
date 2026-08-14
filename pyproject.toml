@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "seqcomp"
-version = "0.2.1"
+version = "0.2.2"
 description = "Validated NorPix SEQ folder compressor and backup tool"
 readme = "README.md"
 license = "GPL-3.0-only"

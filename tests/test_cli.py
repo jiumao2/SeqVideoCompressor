@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -24,7 +25,7 @@ def test_cli_version(capsys) -> None:
 def test_runtime_version_matches_project_metadata() -> None:
     pyproject = Path(__file__).parents[1] / "pyproject.toml"
     metadata = tomllib.loads(pyproject.read_text(encoding="utf-8"))
-    assert __version__ == metadata["project"]["version"] == "0.2.1"
+    assert __version__ == metadata["project"]["version"] == "0.2.2"
 
 
 @pytest.mark.parametrize(
@@ -219,3 +220,30 @@ def test_cli_compresses_a_folder(tmp_path: Path, capsys) -> None:
     assert "Data:" in captured.out and "GB" in captured.out
     assert "Encoding:" in captured.out and "x video time" in captured.out
     assert captured.err == ""
+
+
+@pytest.mark.integration
+def test_cli_cleanup_temp_succeeds_without_seq_pairs(tmp_path: Path, capsys) -> None:
+    from seqcomp.core import TEMPORARY_MINIMUM_AGE_SECONDS, compress_path
+    from seqcomp.encoding import make_settings
+    from seqcomp.ffmpeg_tools import inspect_ffmpeg
+
+    source = tmp_path / "source"
+    seq = create_test_seq(source)
+    idx = Path(f"{seq}.idx")
+    runtime = inspect_ffmpeg(require_environment=True)
+    settings = make_settings()
+    compress_path(source, runtime, settings, yes=True, quiet=True)
+    temporary = source / ".test-recording.000.abcdefgh.seqcomp.tmp.mkv"
+    temporary.write_bytes(b"interrupted partial encode")
+    old = time.time() - TEMPORARY_MINIMUM_AGE_SECONDS - 60
+    os.utime(temporary, (old, old))
+    seq.unlink()
+    idx.unlink()
+
+    code = main(["compress", str(source), "--cleanup-temp", "--quiet"])
+    assert code == 0
+    assert not temporary.exists()
+    output = capsys.readouterr().out
+    assert "cleaned-temp 1" in output
+    assert "Temporary cleanup:" in output

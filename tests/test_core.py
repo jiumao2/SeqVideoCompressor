@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +12,7 @@ from conftest import create_test_seq
 from seqcomp.cli import _parser
 from seqcomp.core import (
     FOLDER_MANIFEST_NAME,
+    TEMPORARY_MINIMUM_AGE_SECONDS,
     compress_path,
     format_duration,
     format_gb,
@@ -24,6 +27,18 @@ from seqcomp.runtime_utils import sha256_file
 
 def _runtime_and_settings():
     return inspect_ffmpeg(require_environment=True), make_settings()
+
+
+def _old_temporary_video(
+    folder: Path,
+    stem: str = "test-recording.000",
+    token: str = "abcdefgh",
+) -> Path:
+    temporary = folder / f".{stem}.{token}.seqcomp.tmp.mkv"
+    temporary.write_bytes(b"interrupted partial encode")
+    old = time.time() - TEMPORARY_MINIMUM_AGE_SECONDS - 60
+    os.utime(temporary, (old, old))
+    return temporary
 
 
 def test_pair_discovery_is_recursive_and_requires_seq_idx(tmp_path: Path) -> None:
@@ -56,6 +71,88 @@ def test_status_report_summarizes_all_raw_recordings(tmp_path: Path) -> None:
     assert "Total space saving:" in report
     assert "Remaining raw-only:" in report
     assert "estimated encoding:" in report
+
+
+def test_status_excludes_seqcomp_temporary_mkv_from_recording_counts(
+    tmp_path: Path,
+) -> None:
+    temporary = _old_temporary_video(
+        tmp_path,
+        "20260712-15-42-58.000",
+        "_9lzcxzw",
+    )
+    assert status_path(tmp_path) == []
+    report = status_report(tmp_path)
+    assert "Recordings: 0" in report
+    assert "incomplete 0" in report
+    assert "Temporary files" in report
+    assert "Detected: 1" in report
+    assert format_gb(temporary.stat().st_size) in report
+    assert "--cleanup-temp" in report
+
+
+def test_similar_user_mkv_is_not_treated_as_seqcomp_temporary(
+    tmp_path: Path,
+) -> None:
+    user_file = tmp_path / ".user-video.not-a-python-token.seqcomp.tmp.mkv"
+    user_file.write_bytes(b"user data")
+    rows = status_path(tmp_path)
+    assert len(rows) == 1
+    assert rows[0]["state"] == "incomplete"
+
+
+def test_cleanup_temp_keeps_file_without_verified_package(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    temporary = _old_temporary_video(source)
+
+    result = compress_path(
+        source,
+        SimpleNamespace(),
+        make_settings(),
+        cleanup_temp=True,
+        quiet=True,
+    )
+    assert result.ok
+    assert result.temporary_cleaned == 0
+    assert result.temporary_kept == 1
+    assert temporary.is_file()
+
+
+def test_cleanup_temp_keeps_file_when_removal_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from seqcomp import core
+
+    source = tmp_path / "source"
+    source.mkdir()
+    temporary = _old_temporary_video(source)
+    monkeypatch.setattr(
+        core,
+        "verify_standalone_package",
+        lambda *args, **kwargs: (True, "verified", {"source": {}}),
+    )
+    original_unlink = Path.unlink
+
+    def fail_temporary_unlink(path: Path, *args, **kwargs) -> None:
+        if path == temporary:
+            raise PermissionError("file is in use")
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_temporary_unlink)
+    result = compress_path(
+        source,
+        SimpleNamespace(),
+        make_settings(),
+        cleanup_temp=True,
+        quiet=True,
+    )
+    assert result.ok
+    assert result.temporary_cleaned == 0
+    assert result.temporary_kept == 1
+    assert result.temporary_bytes_cleaned == 0
+    assert temporary.is_file()
 
 
 @pytest.mark.integration
@@ -123,6 +220,117 @@ def test_rerun_skips_verified_content_and_repairs_tampering(tmp_path: Path) -> N
     repaired = compress_path(source, runtime, settings, dest=destination, yes=True)
     assert repaired.ok
     assert repaired.compressed == 1
+
+
+@pytest.mark.integration
+def test_cleanup_temp_verifies_completed_package_without_source_pair(
+    tmp_path: Path,
+) -> None:
+    runtime, settings = _runtime_and_settings()
+    source = tmp_path / "source"
+    seq = create_test_seq(source)
+    idx = Path(f"{seq}.idx")
+    first = compress_path(source, runtime, settings, yes=True, quiet=True)
+    assert first.compressed == 1
+    temporary = _old_temporary_video(source)
+    size = temporary.stat().st_size
+    seq.unlink()
+    idx.unlink()
+
+    cleaned = compress_path(
+        source,
+        runtime,
+        settings,
+        cleanup_temp=True,
+        quiet=True,
+    )
+    assert cleaned.ok
+    assert cleaned.compressed == 0
+    assert cleaned.temporary_cleaned == 1
+    assert cleaned.temporary_kept == 0
+    assert cleaned.temporary_bytes_cleaned == size
+    assert not temporary.exists()
+    assert (source / "test-recording.000.mkv").is_file()
+
+
+@pytest.mark.integration
+def test_cleanup_temp_dry_run_preserves_eligible_file(tmp_path: Path) -> None:
+    runtime, settings = _runtime_and_settings()
+    source = tmp_path / "source"
+    seq = create_test_seq(source)
+    idx = Path(f"{seq}.idx")
+    compress_path(source, runtime, settings, yes=True, quiet=True)
+    temporary = _old_temporary_video(source)
+    seq.unlink()
+    idx.unlink()
+
+    preview = compress_path(
+        source,
+        runtime,
+        settings,
+        cleanup_temp=True,
+        dry_run=True,
+        quiet=True,
+    )
+    assert preview.temporary_cleaned == 1
+    assert preview.temporary_kept == 0
+    assert temporary.is_file()
+
+
+@pytest.mark.integration
+def test_cleanup_temp_keeps_recent_or_unverified_files(tmp_path: Path) -> None:
+    runtime, settings = _runtime_and_settings()
+    source = tmp_path / "source"
+    seq = create_test_seq(source)
+    idx = Path(f"{seq}.idx")
+    compress_path(source, runtime, settings, yes=True, quiet=True)
+    recent = source / ".test-recording.000.abcdefgh.seqcomp.tmp.mkv"
+    recent.write_bytes(b"active-looking encode")
+    seq.unlink()
+    idx.unlink()
+
+    protected = compress_path(
+        source,
+        runtime,
+        settings,
+        cleanup_temp=True,
+        quiet=True,
+    )
+    assert protected.temporary_cleaned == 0
+    assert protected.temporary_kept == 1
+    assert recent.is_file()
+
+    old = time.time() - TEMPORARY_MINIMUM_AGE_SECONDS - 60
+    os.utime(recent, (old, old))
+    manifest_path = source / "test-recording.000.manifest.json"
+    original_manifest = manifest_path.read_text(encoding="utf-8")
+    wrong_identity = json.loads(original_manifest)
+    wrong_identity["source"]["seq_path"] = "other-recording.000.seq"
+    manifest_path.write_text(json.dumps(wrong_identity), encoding="utf-8")
+    wrong_package = compress_path(
+        source,
+        runtime,
+        settings,
+        cleanup_temp=True,
+        quiet=True,
+    )
+    assert wrong_package.temporary_cleaned == 0
+    assert wrong_package.temporary_kept == 1
+    assert recent.is_file()
+
+    manifest_path.write_text(original_manifest, encoding="utf-8")
+    with (source / "test-recording.000.mkv").open("ab") as stream:
+        stream.write(b"tampered")
+    unverified = compress_path(
+        source,
+        runtime,
+        settings,
+        cleanup_temp=True,
+        quiet=True,
+    )
+    assert unverified.temporary_cleaned == 0
+    assert unverified.temporary_kept == 1
+    assert recent.is_file()
 
 
 @pytest.mark.integration

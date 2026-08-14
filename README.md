@@ -72,13 +72,19 @@ seqcomp compress <path-to-session> --dest <backup-dir> --delete
 
 # Show the planned compression/copy/deletion actions without writing anything
 seqcomp compress <path-to-session> --dest <backup-dir> --delete --dry-run
+
+# Verify and remove stale temporary videos left by interrupted encoding
+seqcomp compress <path-to-session> --cleanup-temp
+
+# Preview temporary cleanup without deleting anything
+seqcomp compress <path-to-session> --cleanup-temp --dry-run
 ```
 
 > **`--delete` is irreversible.** Each verified source pair is deleted immediately, so a later failure can leave the folder partially processed without restoring earlier sources. The default output is lossy and cannot recreate the original JPEG payloads or the original SEQ bytes. Keep a second independent copy until the compressed backup has also been checked in the intended downstream analysis.
 
 ## Command reference
 
-**`seqcomp compress <file-or-folder> [--dest DIR] [--codec {h264,h265,av1}] [--crf N] [--preset NAME] [--av1-preset N] [--keyint N] [--gpu] [--cq N] [--gpu-preset {p1..p7}] [--gpu-device INDEX] [--delete] [--dry-run] [--force] [--yes] [--quiet]`**
+**`seqcomp compress <file-or-folder> [--dest DIR] [--codec {h264,h265,av1}] [--crf N] [--preset NAME] [--av1-preset N] [--keyint N] [--gpu] [--cq N] [--gpu-preset {p1..p7}] [--gpu-device INDEX] [--delete] [--cleanup-temp] [--dry-run] [--force] [--yes] [--quiet]`**
 
 - Recursively processes only `.seq` files with an exact `.seq.idx` sibling. Unpaired `.seq` files are ordinary files and are never interpreted as recordings.
 - CPU defaults: `--codec h265 --crf 18 --preset medium --keyint 250`. AV1 is available only when explicitly selected. All codecs use IDX-guided JPEG payload extraction with FFmpeg MJPEG decoding; verification and SHA-256 calculation are always enabled.
@@ -95,6 +101,7 @@ seqcomp compress <path-to-session> --dest <backup-dir> --delete --dry-run
 - **Without `--dest`**: writes `X.mkv + X.timestamps.npy + X.manifest.json` beside each source pair and leaves every unrelated file unchanged. Verified existing packages are skipped; unverified or conflicting outputs require confirmation, while `--force` replaces them.
 - **With `--dest`**: mirror-backup mode — SEQ/IDX pairs become compressed packages in the corresponding destination folders; all other files are copied atomically and accepted only when their SHA-256 matches. The directory tree, including empty directories, is preserved.
 - `--delete`: immediately after each package is compressed or matched to an existing manifest and fully verified, rehashes that source `.seq + .seq.idx` pair and deletes it. A failed pair is kept and the run is marked as failed, but later recordings and ordinary files are still attempted. Earlier verified deletions are not rolled back.
+- `--cleanup-temp`: scans the output tree for seqcomp video temporaries left by interrupted encoding. A file is removed only when its name exactly matches seqcomp's private temporary format, it is at least 24 hours old, the corresponding `X.mkv + X.timestamps.npy + X.manifest.json` package passes SHA-256, stream, dimension, packet-count, timestamp, and full-decode checks, and the temporary file remains unchanged during verification. If the source SEQ/IDX pair still exists, both source hashes must also match the manifest. Recent, ambiguous, changed, locked, or unverifiable files are kept. Cleanup can run even when no source pairs remain.
 - `--dry-run`: reports the plan without creating, replacing, copying, or deleting files.
 - `--yes`: accepts destination/conflict prompts for unattended runs. `--force` recompresses valid existing packages as well.
 - Output names preserve the full source stem. For example, `20260726-20-12-06.000.seq` produces `20260726-20-12-06.000.mkv`, `20260726-20-12-06.000.timestamps.npy`, and `20260726-20-12-06.000.manifest.json`.
@@ -103,6 +110,7 @@ seqcomp compress <path-to-session> --dest <backup-dir> --delete --dry-run
 **`seqcomp status <file-or-folder> [--gpu] [--gpu-device INDEX] [--ratio R] [--time-ratio R]`**
 
 - Reports each discovered recording as `raw-only`, `both`, `compressed-only`, or `incomplete`, with sizes shown in decimal GB.
+- Exact seqcomp video-temporary names are excluded from recording counts and reported in a separate `Temporary files` section. `status` never removes them.
 - The final folder summary combines all recordings and reports represented source size, actual/projected output size, total space saving, remaining video duration, and estimated remaining encoding time.
 - CPU estimates default to `--ratio 20` and `--time-ratio 1.2`; `--gpu` uses 10 and 0.25 and first verifies NVENC support. For an AV1 planning estimate, use `--ratio 38 --time-ratio 0.93`. Explicit ratio options override either estimate without changing compression settings.
 - Status is based on file existence and size; `compress` performs the full content validation.
@@ -115,10 +123,10 @@ seqcomp compress <path-to-session> --dest <backup-dir> --delete --dry-run
 
 - **Automatic package validation**: every compression checks that sampled JPEG dimensions and the encoded-video dimensions match the SEQ header, that the output contains exactly one video stream and no audio, that its packet count equals the SEQ frame count, that the complete video decodes without FFmpeg errors, and that `timestamps.npy` is an `int64` array exactly equal to all IDX acquisition timestamps. Native-gray H.264/H.265 and Main/4:2:0 full-range AV1/NVENC metadata are checked separately.
 - **SHA-256 is mandatory**: source SEQ/IDX files, output MKV/timestamps, and all mirrored ordinary files are always hashed. There is no option to disable hashing.
-- **Atomic file writes**: video, timestamps, JSON, and mirrored files are written through tool-specific temporary names and renamed into place. Because one recording consists of three outputs, interruption between renames can leave an incomplete package; the next run detects it and refuses to treat it as verified.
+- **Atomic file writes and explicit cleanup**: video, timestamps, JSON, and mirrored files are written through tool-specific temporary names and renamed into place. An abrupt process or system interruption can leave a partial video temporary. It is ignored by recording counts and is never removed automatically; use `--cleanup-temp` (preferably with `--dry-run` first) to apply the verification and age checks described above.
 - **Per-recording verified deletion**: only explicit `--delete` can remove source pairs. Each SEQ/IDX pair is rehashed against its manifest immediately after its compressed package passes validation, then deleted before the next recording starts. A changed or failed pair is kept, but it does not roll back earlier verified deletions.
 - **Verified folder backup**: `.seqcomp_manifest.json` records source/output hashes and codec parameters. Re-runs skip unchanged verified content and detect modified sources, tampered outputs, and same-name/different-content ordinary files.
-- **Source/destination isolation**: source and destination folders may not contain one another. Unrelated temporary-looking user files are never cleaned up.
+- **Source/destination isolation**: source and destination folders may not contain one another. A temporary-looking file that does not satisfy every cleanup rule is retained.
 - **Space check before writing**: before a real run, the destination is checked against a conservative 2x compression floor plus package and mirrored-file overhead. Insufficient space stops the run before any output or deletion.
 - **No byte-exact restore**: H.264, H.265, and AV1 output is lossy, so this project does not provide a command that claims to restore the original `.seq` file. Keep `X.mkv + X.timestamps.npy + X.manifest.json` together.
 

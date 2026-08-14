@@ -432,3 +432,127 @@ def verify_existing_package(
     ) as exc:
         return False, str(exc), outputs
     return True, "verified", outputs
+
+
+def verify_standalone_package(
+    outputs: OutputPaths,
+    runtime: FFmpegRuntime,
+    *,
+    show_progress: bool = False,
+) -> tuple[bool, str, Mapping[str, object] | None]:
+    """Verify a completed package when its source SEQ/IDX pair is unavailable."""
+    missing = [
+        path.name
+        for path in (outputs.video, outputs.timestamps, outputs.manifest)
+        if not path.is_file()
+    ]
+    if missing:
+        return False, f"missing: {', '.join(missing)}", None
+    try:
+        manifest = json.loads(outputs.manifest.read_text(encoding="utf-8"))
+        if not isinstance(manifest, Mapping):
+            return False, "manifest root must be a JSON object", None
+        for section in ("source", "encoding", "video", "timestamps", "validation"):
+            if not isinstance(manifest.get(section), Mapping):
+                return False, f"manifest section {section!r} must be a JSON object", None
+        video = manifest["video"]
+        timestamps_record = manifest["timestamps"]
+        validation = manifest["validation"]
+        source = manifest["source"]
+        expected_seq_name = f"{outputs.video.stem}.seq"
+        identity_checks = (
+            (source.get("seq_path"), expected_seq_name, "source SEQ"),
+            (source.get("idx_path"), f"{expected_seq_name}.idx", "source IDX"),
+            (video.get("path"), outputs.video.name, "video"),
+            (
+                timestamps_record.get("path"),
+                outputs.timestamps.name,
+                "timestamp sidecar",
+            ),
+        )
+        for recorded_path, expected_name, label in identity_checks:
+            if (
+                not isinstance(recorded_path, str)
+                or Path(recorded_path).name != expected_name
+            ):
+                return False, f"manifest {label} name mismatch", manifest
+        if show_progress:
+            print("  [verify]   calculating completed-package SHA-256")
+        if video.get("video_sha256") != sha256_file(
+            outputs.video,
+            show_progress=show_progress,
+            description=f"Hash package {outputs.video.name}",
+        ):
+            return False, "video SHA-256 mismatch", manifest
+        if timestamps_record.get("timestamps_sha256") != sha256_file(
+            outputs.timestamps,
+            show_progress=show_progress,
+            description=f"Hash package {outputs.timestamps.name}",
+        ):
+            return False, "timestamp SHA-256 mismatch", manifest
+        validation_flags = (
+            "timestamps_exact",
+            "video_packet_count_exact",
+            "full_decode_valid",
+        )
+        for flag in validation_flags:
+            if validation.get(flag) is not True:
+                return False, f"manifest validation flag {flag!r} is not true", manifest
+        frame_count = int(video["frame_count"])
+        width = int(video["width"])
+        height = int(video["height"])
+        timestamp_count = int(timestamps_record["count"])
+        timestamps = np.load(outputs.timestamps, allow_pickle=False)
+        if timestamps_record.get("dtype") != "int64":
+            return False, "manifest timestamp dtype is not int64", manifest
+        if timestamps_record.get("unit") != "unix_us":
+            return False, "manifest timestamp unit is not unix_us", manifest
+        if timestamps.dtype != np.int64 or timestamps.shape != (timestamp_count,):
+            return False, "timestamp sidecar shape or dtype mismatch", manifest
+        if timestamp_count != frame_count:
+            return False, "timestamp count does not match video frame count", manifest
+        if show_progress:
+            print("  [verify]   checking streams, dimensions, packets, and full decode")
+        probe = probe_video(runtime, outputs.video)
+        if int(probe.get("audio_stream_count", -1)) != 0:
+            return False, "output contains an audio stream", manifest
+        if int(probe.get("stream_count", -1)) != 1:
+            return False, "output must contain exactly one video stream", manifest
+        if (int(probe.get("width", -1)), int(probe.get("height", -1))) != (
+            width,
+            height,
+        ):
+            return False, "video dimensions do not match manifest", manifest
+        recorded_probe = video.get("probe")
+        if isinstance(recorded_probe, Mapping):
+            probe_keys = (
+                "codec_name",
+                "profile",
+                "pix_fmt",
+                "color_range",
+                "color_space",
+                "color_transfer",
+                "color_primaries",
+            )
+            for key in probe_keys:
+                if key in recorded_probe and probe.get(key) != recorded_probe.get(key):
+                    return False, f"video {key} does not match manifest", manifest
+        if _count_video_packets(runtime, outputs.video) != frame_count:
+            return False, "video packet count mismatch", manifest
+        _validate_full_decode(
+            runtime,
+            outputs.video,
+            frame_count,
+            show_progress=show_progress,
+        )
+    except (
+        AttributeError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+        json.JSONDecodeError,
+    ) as exc:
+        return False, str(exc), None
+    return True, "verified", manifest

@@ -72,13 +72,19 @@ seqcomp compress <会话路径> --dest <备份目录> --delete
 
 # 只显示计划中的压缩、复制和删除操作，不写入文件
 seqcomp compress <会话路径> --dest <备份目录> --delete --dry-run
+
+# 校验并删除编码中断后遗留的过期临时视频
+seqcomp compress <会话路径> --cleanup-temp
+
+# 只预览临时文件清理，不删除任何内容
+seqcomp compress <会话路径> --cleanup-temp --dry-run
 ```
 
 > **`--delete` 不可逆。** 每个通过校验的源文件对都会立即删除，因此后续文件失败时，文件夹可能处于部分完成状态，先前删除的源文件不会恢复。默认输出是有损视频，无法重建原始 JPEG payload 或原始 SEQ 字节。请至少保留一份独立副本，直到压缩备份也通过实际下游分析检查。
 
 ## 命令参考
 
-**`seqcomp compress <文件或文件夹> [--dest DIR] [--codec {h264,h265,av1}] [--crf N] [--preset NAME] [--av1-preset N] [--keyint N] [--gpu] [--cq N] [--gpu-preset {p1..p7}] [--gpu-device INDEX] [--delete] [--dry-run] [--force] [--yes] [--quiet]`**
+**`seqcomp compress <文件或文件夹> [--dest DIR] [--codec {h264,h265,av1}] [--crf N] [--preset NAME] [--av1-preset N] [--keyint N] [--gpu] [--cq N] [--gpu-preset {p1..p7}] [--gpu-device INDEX] [--delete] [--cleanup-temp] [--dry-run] [--force] [--yes] [--quiet]`**
 
 - 递归处理仅限具有同名 `.seq.idx` sibling 的 `.seq` 文件。未配对的 `.seq` 只作为普通文件处理，绝不会被解释为视频。
 - CPU 默认值：`--codec h265 --crf 18 --preset medium --keyint 250`。AV1 仅在显式选择时启用。所有 codec 均使用 IDX 引导的 JPEG payload 提取和 FFmpeg MJPEG 解码；校验和 SHA-256 计算始终启用。
@@ -95,6 +101,7 @@ seqcomp compress <会话路径> --dest <备份目录> --delete --dry-run
 - **无 `--dest`**：在每个源文件对旁生成 `X.mkv + X.timestamps.npy + X.manifest.json`，所有无关文件保持不变。已经验证的输出会跳过；未验证或冲突的输出需要确认，`--force` 可替换它们。
 - **有 `--dest`**：镜像备份模式 —— SEQ/IDX 文件对在目标目录对应位置转换为压缩包，其余文件原子复制，并且只有 SHA-256 一致才视为成功；完整目录结构和空目录都会保留。
 - `--delete`：每个压缩包完成压缩，或与现有 manifest 匹配并通过完整校验后，立即重新哈希对应的源 `.seq + .seq.idx` 并删除。某个文件对失败时会保留该文件对，并将本次运行标记为失败；程序仍会继续尝试后续视频和普通文件，此前已经验证并删除的源文件不会恢复。
+- `--cleanup-temp`：扫描输出目录树中因编码中断遗留的 seqcomp 视频临时文件。只有同时满足以下条件才会删除：文件名严格符合 seqcomp 的专用临时格式、文件至少已有 24 小时、对应的 `X.mkv + X.timestamps.npy + X.manifest.json` 正式压缩包通过 SHA-256、stream、尺寸、packet 数、时间戳和完整解码校验，并且临时文件在校验期间未发生变化。如果源 SEQ/IDX 文件对仍存在，两者的哈希还必须与 manifest 一致。较新、有歧义、发生变化、被占用或无法验证的文件都会保留。即使已经没有源文件对，也可以单独执行清理。
 - `--dry-run`：只报告计划，不创建、替换、复制或删除文件。
 - `--yes`：在无人值守运行中接受目标目录和冲突确认。`--force` 还会重新压缩已经验证的输出。
 - 输出文件名完整保留源文件 stem。例如，`20260726-20-12-06.000.seq` 生成 `20260726-20-12-06.000.mkv`、`20260726-20-12-06.000.timestamps.npy` 和 `20260726-20-12-06.000.manifest.json`。
@@ -103,6 +110,7 @@ seqcomp compress <会话路径> --dest <备份目录> --delete --dry-run
 **`seqcomp status <文件或文件夹> [--gpu] [--gpu-device INDEX] [--ratio R] [--time-ratio R]`**
 
 - 把每个发现的视频报告为 `raw-only`、`both`、`compressed-only` 或 `incomplete`，体积统一以十进制 GB 显示。
+- 严格符合 seqcomp 视频临时命名的文件不计入 recording 数量，而是在单独的 `Temporary files` 小节中报告；`status` 绝不会删除它们。
 - 文件夹末尾会汇总全部视频的源文件体积、实际或预计输出体积、总节省空间、尚未压缩的视频时长和预计剩余编码时间。
 - CPU 默认按 `--ratio 20` 和 `--time-ratio 1.2` 估算；`--gpu` 使用 10 和 0.25，并先确认 NVENC 可用。规划 AV1 时可使用 `--ratio 38 --time-ratio 0.93`。显式提供 ratio 参数可分别覆盖估算，但不会改变实际压缩参数。
 - `status` 只依据文件是否存在和体积判断；完整内容校验由 `compress` 执行。
@@ -115,10 +123,10 @@ seqcomp compress <会话路径> --dest <备份目录> --delete --dry-run
 
 - **自动压缩包校验**：每次压缩都检查抽样 JPEG 尺寸和编码视频尺寸与 SEQ header 一致、输出恰好只有一个视频 stream 且没有音频、video packet 数与 SEQ 帧数相等、完整视频可以由 FFmpeg 无错误解码，并确认 `timestamps.npy` 是与全部 IDX 采集时间戳逐项相等的 `int64` 数组；原生灰度 H.264/H.265 与 Main/4:2:0 full-range AV1/NVENC 元数据会分别校验。
 - **强制 SHA-256**：源 SEQ/IDX、输出 MKV/timestamps 和镜像复制的所有普通文件始终计算哈希，不提供关闭哈希的参数。
-- **原子文件写入**：视频、时间戳、JSON 和镜像文件先写入工具专用临时名称，再改名为正式文件。一个视频包含三个输出，因此在多次改名之间中断可能留下不完整压缩包；下次运行会检测到，并拒绝把它当作已验证输出。
+- **原子文件写入与显式清理**：视频、时间戳、JSON 和镜像文件先写入工具专用临时名称，再改名为正式文件。进程或系统突然中断可能遗留部分写入的视频临时文件。它们不会计入 recording 数量，也不会被自动删除；可使用 `--cleanup-temp`（建议先配合 `--dry-run`）执行上述年龄与完整校验后再清理。
 - **逐视频验证后删除**：只有显式 `--delete` 才能删除源文件对。每个 SEQ/IDX 文件对的压缩包通过校验后，会立即重新计算源文件哈希并与 manifest 比较，随后在处理下一个视频前删除。发生变化或失败的文件对会保留，但不会回滚此前已经验证的删除。
 - **经过校验的文件夹备份**：`.seqcomp_manifest.json` 记录源文件/输出哈希和编码参数。重复运行会跳过未改变且通过验证的内容，并识别源文件变化、输出篡改以及同名但内容不同的普通文件。
-- **源目录与目标目录隔离**：源目录和目标目录不能互相包含。工具不会清理名称类似临时文件的无关用户文件。
+- **源目录与目标目录隔离**：源目录和目标目录不能互相包含。任何未满足全部清理规则的疑似临时文件都会保留。
 - **写入前空间检查**：实际运行前按照保守的 2 倍压缩率下限，加上压缩包和镜像文件开销检查目标空间；空间不足会在生成任何输出或删除源文件前停止。
 - **不提供原字节恢复**：H.264、H.265 和 AV1 输出均为有损视频，因此本项目不会提供声称能够恢复原始 `.seq` 的命令。请始终保留 `X.mkv + X.timestamps.npy + X.manifest.json` 三件套。
 
